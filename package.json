@@ -1,0 +1,17 @@
+{
+  "name": "loop-rates-database-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Render cron worker that refreshes LOOP savings rate sources and writes the shared catalogue directly to Supabase.",
+  "scripts": {
+    "start": "node src/run.mjs",
+    "check": "node --check src/run.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4"
+  }
+}

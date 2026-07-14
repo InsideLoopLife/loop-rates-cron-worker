@@ -1,0 +1,28 @@
+services:
+  - type: cron
+    name: loop-rates-database-worker
+    runtime: node
+    plan: starter
+    branch: main
+    buildCommand: npm ci
+    startCommand: node src/run.mjs
+    schedule: "0 7,8 * * *"
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: ENFORCE_UK_8AM
+        value: "true"
+      - key: FORCE_RUN
+        value: "false"
+      - key: SOURCE_LIMIT
+        value: "40"
+      - key: FRESHNESS_HOURS
+        value: "20"
+      - key: PUBLISH_CONFIDENCE_THRESHOLD
+        value: "92"
+      - key: FETCH_TIMEOUT_MS
+        value: "15000"
+      - key: USER_AGENT
+        value: "LOOP rates catalogue worker/1.0"
