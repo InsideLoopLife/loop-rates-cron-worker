@@ -9,7 +9,7 @@
     "check": "node --check src/run.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": "22.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4"
