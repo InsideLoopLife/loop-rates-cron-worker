@@ -1,12 +1,13 @@
 {
   "name": "loop-rates-database-worker",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Standalone Render cron worker that refreshes LOOP savings rate sources and writes the shared catalogue directly to Supabase.",
+  "description": "Standalone Render cron worker that refreshes LOOP savings and mortgage catalogues and schedules daily app maintenance.",
   "scripts": {
     "start": "node src/run.mjs",
-    "check": "node --check src/run.mjs"
+    "check": "node --check src/run.mjs && node --check src/rates-parser.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": "22.x"

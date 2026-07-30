@@ -1,60 +1,62 @@
-# LOOP Rates Database Worker
+# LOOP Rates and Daily Maintenance Worker
 
-A standalone Render cron service that writes shared savings, Cash ISA and fixed-term product data directly to the LOOP Supabase database.
+This Render cron job now refreshes both shared rate catalogues directly in
+Supabase:
 
-It does **not** call localhost or a deployed LOOP web app.
+- savings, Cash ISA, regular saver, notice and fixed-term products;
+- mortgage products, including rate type, initial term, LTV and product fee.
 
-## Data flow
+It can also call the protected user-specific maintenance routes in the deployed
+LOOP app after the catalogues are refreshed. It never needs a user to open a
+page.
 
-```text
-Configured provider/source pages
-        ↓
-Render cron worker
-        ↓
-Supabase savings_rate_sources
-Supabase savings_rate_deals
-Supabase wealth_watch_source_jobs
-        ↓
-LOOP app reads the shared catalogue
-```
+## Run order
 
-## Required existing tables
+1. Fetch due savings sources.
+2. Parse and validate coherent products.
+3. Fetch due mortgage lender sources.
+4. Validate term, LTV, fee and market-rate plausibility.
+5. Mark products missing from three successful observations as withdrawn.
+6. If `APP_BASE_URL` and `CRON_SECRET` are configured, run the user-specific
+   mortgage watch, LoopWatch, briefings, snapshots, pensions, product pricing,
+   archive cleanup, glossary, notification and weekly digest routes.
 
-The LOOP database must already include:
+Investment market quotes and SnapTrade snapshots are deliberately excluded:
+they already belong to LOOP's dedicated market-data worker and must not be
+duplicated here.
 
-- `savings_rate_sources`
-- `savings_rate_deals`
-- `wealth_watch_source_jobs` (optional for logging; the worker still runs if unavailable)
+## Required setup
 
-Sources must be added to `savings_rate_sources`. Only rows with status `active` or `needs_review` are checked.
+Run `sql/v2_rates_worker.sql` in Supabase before deploying this version.
 
-## Render setup
-
-Create a Render Blueprint from this repository, or create a Cron Job manually with:
-
-- Runtime: Node
-- Build command: `npm ci`
-- Command: `node src/run.mjs`
-- Schedule: `0 7,8 * * *`
-- Plan: Starter
-
-Environment variables:
+Required Render environment variables:
 
 - `SUPABASE_URL`
 - `SUPABASE_SECRET_KEY`
 
-The secret key is server-only. Never add it to frontend code or commit it to GitHub.
+For the app maintenance routes also set:
 
-The worker runs at 07:00 and 08:00 UTC and only proceeds when the Europe/London local hour is 08:00. Set `FORCE_RUN=true` temporarily to test immediately.
+- `APP_BASE_URL` to the deployed LOOP application, with no trailing slash
+- `CRON_SECRET` to the same server-side value used by the LOOP app
 
-## Test
+The worker still refreshes both catalogues if those two app variables are not
+set. Only user-specific maintenance is skipped.
 
-1. Set `FORCE_RUN=true` in Render.
-2. Trigger the cron job manually.
-3. Inspect Render logs.
-4. Confirm rows were updated in `savings_rate_sources` and `savings_rate_deals`.
-5. Restore `FORCE_RUN=false`.
+## Schedule
 
-## Important
+Keep the Render schedule at `0 7,8 * * *`. The worker checks Europe/London and
+only proceeds at 08:00 local time, so daylight-saving changes do not create two
+runs.
 
-This worker is an ingestion and normalisation layer. It does not claim that a product is suitable for a user. High-confidence rows can be marked `active`; lower-confidence rows are stored as `needs_review` for admin verification.
+## Manual verification
+
+1. Apply the SQL migration.
+2. Deploy to Render.
+3. Temporarily set `FORCE_RUN=true`.
+4. Run the cron job manually.
+5. In the logs, confirm both `savings` and `mortgages` show checked/deal counts.
+6. Confirm suspicious or incomplete products are `needs_review`/`broken`.
+7. Restore `FORCE_RUN=false`.
+
+Provider failures no longer fail the entire Render execution or advance their
+successful-check clock. They remain due for retry.

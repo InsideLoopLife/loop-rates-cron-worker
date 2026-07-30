@@ -1,34 +1,31 @@
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
+import { parseMortgageDeals, parseSavingsDeals } from "./rates-parser.mjs";
 
 const config = {
   supabaseUrl: required("SUPABASE_URL"),
   supabaseSecretKey: required("SUPABASE_SECRET_KEY"),
   enforceUk8am: bool("ENFORCE_UK_8AM", true),
   forceRun: bool("FORCE_RUN", false),
-  sourceLimit: int("SOURCE_LIMIT", 40, 1, 100),
+  savingsSourceLimit: int("SAVINGS_SOURCE_LIMIT", int("SOURCE_LIMIT", 40, 1, 100), 1, 100),
+  mortgageSourceLimit: int("MORTGAGE_SOURCE_LIMIT", 40, 1, 100),
   freshnessHours: int("FRESHNESS_HOURS", 20, 1, 168),
-  publishThreshold: int("PUBLISH_CONFIDENCE_THRESHOLD", 92, 1, 100),
+  publishThreshold: int("PUBLISH_CONFIDENCE_THRESHOLD", 92, 70, 100),
+  mortgagePublishThreshold: int("MORTGAGE_PUBLISH_CONFIDENCE_THRESHOLD", 95, 75, 100),
+  missingObservationsBeforeExpiry: int("MISSING_OBSERVATIONS_BEFORE_EXPIRY", 3, 2, 10),
   fetchTimeoutMs: int("FETCH_TIMEOUT_MS", 15000, 3000, 60000),
-  userAgent: process.env.USER_AGENT || "LOOP rates catalogue worker/1.0",
+  userAgent: process.env.USER_AGENT || "LOOP rates catalogue worker/2.0",
+  appBaseUrl: process.env.APP_BASE_URL?.replace(/\/+$/, "") || null,
+  cronSecret: process.env.CRON_SECRET?.trim() || null,
+  runAppMaintenance: bool("RUN_APP_MAINTENANCE", true),
 };
 
 const supabase = createClient(config.supabaseUrl, config.supabaseSecretKey, {
   auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
-  global: { headers: { "x-loop-worker": "rates-database-worker" } },
+  global: { headers: { "x-loop-worker": "rates-database-worker-v2" } },
 });
 
-const ukNow = new Intl.DateTimeFormat("en-GB", {
-  timeZone: "Europe/London",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-}).formatToParts(new Date()).reduce((acc, part) => ({ ...acc, [part.type]: part.value }), {});
-
+const ukNow = londonParts();
 if (config.enforceUk8am && !config.forceRun && Number(ukNow.hour) !== 8) {
   log("worker_skipped", { reason: "Not 08:00 Europe/London", ukTime: `${ukNow.year}-${ukNow.month}-${ukNow.day} ${ukNow.hour}:${ukNow.minute}:${ukNow.second}` });
   process.exit(0);
@@ -36,331 +33,376 @@ if (config.enforceUk8am && !config.forceRun && Number(ukNow.hour) !== 8) {
 
 const runKey = `render_rates_${ukNow.year}${ukNow.month}${ukNow.day}_${crypto.randomUUID().slice(0, 8)}`;
 const startedAt = new Date().toISOString();
-let sourceJobId = null;
 
 try {
-  sourceJobId = await createRunLog(runKey);
-  const threshold = new Date(Date.now() - config.freshnessHours * 3600_000).toISOString();
-  let query = supabase
-    .from("savings_rate_sources")
-    .select("id,provider_slug,provider_name,source_url,source_kind,product_hint,status,last_checked_at,check_frequency_hours")
-    .in("status", ["active", "needs_review"])
-    .order("last_checked_at", { ascending: true, nullsFirst: true })
-    .limit(config.sourceLimit);
+  log("worker_started", { runKey, startedAt });
+  const savings = await refreshSavings();
+  const mortgages = await refreshMortgages();
+  const maintenance = config.runAppMaintenance ? await runAppMaintenance() : { skipped: true, reason: "RUN_APP_MAINTENANCE=false" };
+  const failed = savings.failed + mortgages.failed + (maintenance.failed || 0);
+  const result = { ok: failed === 0, runKey, savings, mortgages, maintenance };
+  log(failed ? "worker_completed_with_warnings" : "worker_succeeded", result);
+  // Individual provider failures are reported and retried next run. A partial provider
+  // outage must not make Render treat an otherwise useful catalogue refresh as crashed.
+  process.exitCode = 0;
+} catch (error) {
+  log("worker_failed", { runKey, error: messageOf(error) });
+  process.exitCode = 1;
+}
 
-  if (!config.forceRun) query = query.or(`last_checked_at.is.null,last_checked_at.lt.${threshold}`);
+async function refreshSavings() {
+  const job = await createRunLog("savings_catalogue_refresh");
+  const sources = await loadDueSources({
+    table: "savings_rate_sources",
+    fields: "id,provider_slug,provider_name,source_url,source_kind,product_hint,status,last_checked_at,check_frequency_hours",
+    limit: config.savingsSourceLimit,
+  });
+  const summary = baseSummary(sources.length);
 
-  const { data: sources, error: sourceError } = await query;
-  if (sourceError) throw new Error(`Could not load savings_rate_sources: ${sourceError.message}`);
-
-  const summary = { checked: 0, inserted: 0, updated: 0, failed: 0, dealsParsed: 0, detail: [] };
-  log("worker_started", { runKey, sourceCount: sources?.length || 0, startedAt });
-
-  for (const source of sources || []) {
-    summary.checked += 1;
+  for (const source of sources) {
     try {
       const fetched = await fetchSource(source.source_url);
-      const deals = parseDeals({
+      const parsed = parseSavingsDeals({
         providerName: source.provider_name,
         providerSlug: source.provider_slug,
         productHint: source.product_hint,
         sourceUrl: fetched.url,
         text: fetched.text,
       });
-      summary.dealsParsed += deals.length;
+      if (!parsed.length) throw new Error("No coherent savings products found; source requires review");
 
-      for (const deal of deals) {
-        const existing = await supabase
-          .from("savings_rate_deals")
-          .select("id")
-          .eq("provider_slug", deal.provider_slug)
-          .eq("product_name", deal.product_name)
-          .eq("source_url", deal.source_url)
-          .maybeSingle();
-        if (existing.error) throw new Error(existing.error.message);
-
-        const now = new Date().toISOString();
-        const row = {
+      const existingRows = await selectRows("savings_rate_deals", "id,source_product_id,status,lifecycle_status,missing_observation_count,source_payload,gross_aer,verification_status,source_url", (q) =>
+        q.eq("canonical_source", String(source.id))
+      );
+      const existingByKey = new Map(existingRows.map((row) => [row.source_product_id, row]));
+      const seen = new Set();
+      const rows = parsed.map((deal) => {
+        const sourceProductId = deal.source_product_id;
+        seen.add(sourceProductId);
+        const prior = existingByKey.get(sourceProductId);
+        const publishable = deal.publishable && deal.confidence >= config.publishThreshold;
+        return {
           ...deal,
-          status: deal.confidence >= config.publishThreshold ? "active" : "needs_review",
-          detected_by: "render_direct_database_worker",
-          source_name: new URL(deal.source_url).hostname,
-          last_checked_at: now,
-          updated_at: now,
+          status: prior?.status === "active" && publishable ? "active" : publishable ? "active" : "needs_review",
+          detected_by: "render_direct_database_worker_v2",
+          source_name: hostname(fetched.url),
+          last_checked_at: nowIso(),
+          last_seen_at: nowIso(),
+          last_verified_at: publishable ? nowIso() : null,
+          updated_at: nowIso(),
+          canonical_source: String(source.id),
+          source_product_id: sourceProductId,
+          verification_status: publishable ? "AUTO_VERIFIED" : "REVIEW_REQUIRED",
+          lifecycle_status: publishable ? "ACTIVE" : "DATA_REVIEW",
+          missing_observation_count: 0,
+          raw_payload_hash: fetched.hash,
           source_payload: {
-            worker: "loop-rates-database-worker",
+            worker: "loop-rates-database-worker-v2",
             run_key: runKey,
-            extracted_at: now,
-            raw_hash: fetched.hash,
-            source_kind: source.source_kind,
             source_id: source.id,
+            source_kind: source.source_kind,
+            evidence: deal.evidence,
+            validation: deal.validation,
           },
-          admin_notes: deal.confidence >= config.publishThreshold
-            ? "Auto-published because extraction confidence met the configured threshold."
-            : "Direct source extraction requires admin review before publication.",
+          admin_notes: publishable ? null : deal.review_reasons.join(" "),
         };
+      });
 
-        const write = existing.data?.id
-          ? await supabase.from("savings_rate_deals").update(row).eq("id", existing.data.id).select("id").single()
+      for (const row of rows) {
+        const prior = existingByKey.get(row.source_product_id);
+        const write = prior
+          ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
           : await supabase.from("savings_rate_deals").insert(row).select("id").single();
-        if (write.error) throw new Error(write.error.message);
-        if (existing.data?.id) summary.updated += 1;
-        else summary.inserted += 1;
+        throwIf(write.error);
+        prior ? summary.updated++ : summary.inserted++;
       }
-
-      const sourceResult = {
-        parsed_deals: deals.length,
-        highest_rate: deals.reduce((max, item) => Math.max(max, Number(item.gross_aer || 0)), 0),
-        raw_hash: fetched.hash,
-        run_key: runKey,
-      };
-      let sourceUpdate = await supabase.from("savings_rate_sources").update({
-        last_checked_at: new Date().toISOString(),
-        last_success_at: new Date().toISOString(),
-        last_error: null,
-        updated_at: new Date().toISOString(),
-        last_result_payload: sourceResult,
-      }).eq("id", source.id);
-      if (sourceUpdate.error && /last_result_payload/i.test(sourceUpdate.error.message || "")) {
-        sourceUpdate = await supabase.from("savings_rate_sources").update({
-          last_checked_at: new Date().toISOString(),
-          last_success_at: new Date().toISOString(),
-          last_error: null,
-          updated_at: new Date().toISOString(),
-        }).eq("id", source.id);
-      }
-      if (sourceUpdate.error) throw new Error(sourceUpdate.error.message);
-      summary.detail.push({ sourceId: source.id, provider: source.provider_name, ok: true, deals: deals.length });
+      summary.expired += await markMissingSavings(existingRows, seen);
+      summary.dealsParsed += parsed.length;
+      await markSourceSuccess("savings_rate_sources", source.id, parsed.length, fetched.hash);
+      summary.detail.push({ sourceId: source.id, provider: source.provider_name, ok: true, deals: parsed.length });
     } catch (error) {
-      summary.failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      summary.detail.push({ sourceId: source.id, provider: source.provider_name, ok: false, error: message });
-      await supabase.from("savings_rate_sources").update({
-        last_checked_at: new Date().toISOString(),
-        last_error: message.slice(0, 1500),
-        updated_at: new Date().toISOString(),
-      }).eq("id", source.id);
+      summary.failed++;
+      await markSourceFailure("savings_rate_sources", source.id, error);
+      summary.detail.push({ sourceId: source.id, provider: source.provider_name, ok: false, error: messageOf(error) });
     }
   }
-
-  await finishRunLog(sourceJobId, summary.failed ? "failed" : "completed", summary, summary.failed ? `${summary.failed} source(s) failed` : null);
-  log("worker_succeeded", { runKey, ...summary, detail: undefined });
-  if (summary.failed) process.exitCode = 1;
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  await finishRunLog(sourceJobId, "failed", {}, message).catch(() => undefined);
-  log("worker_failed", { runKey, error: message });
-  process.exitCode = 1;
+  await finishRunLog(job, "completed", summary);
+  return summary;
 }
 
-async function createRunLog(runKey) {
-  const payload = {
-    job_kind: "savings_catalogue_refresh",
+async function refreshMortgages() {
+  const job = await createRunLog("mortgage_catalogue_refresh");
+  const sources = await loadDueSources({
+    table: "mortgage_lender_sources",
+    fields: "id,lender_slug,lender_name,source_url,source_kind,status,last_checked_at,check_frequency_hours",
+    limit: config.mortgageSourceLimit,
+  });
+  const summary = baseSummary(sources.length);
+
+  for (const source of sources) {
+    try {
+      const fetched = await fetchSource(source.source_url);
+      const market = await currentMortgageMarket();
+      const parsed = parseMortgageDeals({
+        lenderName: source.lender_name,
+        lenderSlug: source.lender_slug,
+        sourceUrl: fetched.url,
+        text: fetched.text,
+        market,
+      });
+      if (!parsed.length) throw new Error("No coherent mortgage products found; source requires review");
+
+      const existingRows = await selectRows("mortgage_rate_deals", "id,external_product_key,status,catalogue_status,missing_observation_count", (q) =>
+        q.eq("source_id", source.id).in("catalogue_status", ["active", "needs_review", "broken", "pending_withdrawal"])
+      );
+      const existingByKey = new Map(existingRows.map((row) => [row.external_product_key, row]));
+      const seen = new Set();
+
+      for (const deal of parsed) {
+        seen.add(deal.external_product_key);
+        const prior = existingByKey.get(deal.external_product_key);
+        const publishable = deal.publishable && deal.confidence >= config.mortgagePublishThreshold;
+        const catalogueStatus = deal.anomaly ? "broken" : publishable ? "active" : "needs_review";
+        const row = {
+          lender_slug: deal.lender_slug,
+          lender_name: deal.lender_name,
+          product_name: deal.product_name,
+          rate_type: deal.rate_type,
+          initial_term_months: deal.initial_term_months,
+          ltv_max: deal.ltv_max,
+          ltv_min: deal.ltv_min,
+          rate_percent: deal.rate_percent,
+          product_fee: deal.product_fee,
+          existing_customer_only: deal.existing_customer_only,
+          new_customer_available: deal.new_customer_available,
+          source_url: fetched.url,
+          source_name: hostname(fetched.url),
+          source_checked_at: nowIso(),
+          confidence: deal.confidence,
+          status: catalogueStatus === "active" ? "active" : "needs_review",
+          catalogue_status: catalogueStatus,
+          ingestion_method: "deterministic_source_catalogue_v2",
+          source_id: source.id,
+          external_product_key: deal.external_product_key,
+          admin_review_reason: publishable ? null : deal.review_reasons.join(" "),
+          removed_detected_at: null,
+          missing_observation_count: 0,
+          updated_at: nowIso(),
+          payload: {
+            summary: deal.summary,
+            evidence: deal.evidence,
+            validation: deal.validation,
+            market_reference: market,
+            worker: "loop-rates-database-worker-v2",
+            run_key: runKey,
+          },
+        };
+        const write = prior
+          ? await supabase.from("mortgage_rate_deals").update(row).eq("id", prior.id).select("id").single()
+          : await supabase.from("mortgage_rate_deals").insert(row).select("id").single();
+        throwIf(write.error);
+        prior ? summary.updated++ : summary.inserted++;
+      }
+      summary.expired += await markMissingMortgages(existingRows, seen);
+      summary.dealsParsed += parsed.length;
+      await markSourceSuccess("mortgage_lender_sources", source.id, parsed.length, fetched.hash);
+      summary.detail.push({ sourceId: source.id, lender: source.lender_name, ok: true, deals: parsed.length });
+    } catch (error) {
+      summary.failed++;
+      await markSourceFailure("mortgage_lender_sources", source.id, error);
+      summary.detail.push({ sourceId: source.id, lender: source.lender_name, ok: false, error: messageOf(error) });
+    }
+  }
+  await finishRunLog(job, "completed", summary);
+  return summary;
+}
+
+async function runAppMaintenance() {
+  if (!config.appBaseUrl || !config.cronSecret) {
+    return { skipped: true, failed: 0, reason: "APP_BASE_URL/CRON_SECRET not configured; catalogue ingestion still completed directly" };
+  }
+  // These jobs contain user-specific/tier-specific business logic and therefore stay in
+  // the app. The Render job is their scheduler; rates ingestion above remains direct.
+  const paths = [
+    "/api/cron/savings-rate-watch?mode=watch_only",
+    "/api/cron/mortgage-renewal-watch",
+    "/api/cron/loopwatch-daily",
+    "/api/cron/deal-news-review",
+    "/api/cron/daily-financial-briefing",
+    "/api/cron/daily-snapshot",
+    "/api/cron/investment-pension-snapshot",
+    "/api/cron/pension-performance-refresh",
+    "/api/cron/pensions-daily",
+    "/api/cron/product-price-refresh",
+    "/api/cron/property-archive-cleanup",
+    "/api/cron/provider-glossary-daily-check",
+    "/api/cron/notification-insights",
+  ];
+  if (new Date().getUTCDay() === 1) paths.push("/api/cron/weekly-digest");
+  const detail = [];
+  for (const path of paths) {
+    try {
+      const response = await fetch(`${config.appBaseUrl}${path}`, {
+        headers: { authorization: `Bearer ${config.cronSecret}`, "x-loop-worker": "rates-database-worker-v2" },
+        signal: AbortSignal.timeout(120_000),
+      });
+      const body = (await response.text()).slice(0, 1500);
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${body}`);
+      detail.push({ path, ok: true });
+    } catch (error) {
+      detail.push({ path, ok: false, error: messageOf(error) });
+    }
+  }
+  return { skipped: false, checked: paths.length, failed: detail.filter((row) => !row.ok).length, detail };
+}
+
+async function loadDueSources({ table, fields, limit }) {
+  const { data, error } = await supabase.from(table).select(fields).in("status", ["active", "needs_review", "failed"]).order("last_checked_at", { ascending: true, nullsFirst: true }).limit(limit);
+  throwIf(error);
+  if (config.forceRun) return data || [];
+  const now = Date.now();
+  return (data || []).filter((source) => {
+    if (!source.last_checked_at) return true;
+    const frequency = Math.max(1, Number(source.check_frequency_hours || config.freshnessHours));
+    return new Date(source.last_checked_at).getTime() <= now - frequency * 3600_000;
+  });
+}
+
+async function currentMortgageMarket() {
+  const { data, error } = await supabase.from("mortgage_rate_deals").select("rate_percent").eq("catalogue_status", "active").gte("source_checked_at", new Date(Date.now() - 14 * 86400_000).toISOString()).limit(500);
+  if (error) return { median: null, lowerBound: null, upperBound: null, sampleSize: 0 };
+  const rates = (data || []).map((row) => Number(row.rate_percent)).filter((n) => Number.isFinite(n) && n > 0 && n < 20).sort((a, b) => a - b);
+  const median = rates.length ? rates[Math.floor(rates.length / 2)] : null;
+  return {
+    median,
+    lowerBound: median ? Math.max(0.5, median * 0.72) : null,
+    upperBound: median ? median * 1.55 : null,
+    sampleSize: rates.length,
+  };
+}
+
+async function markMissingSavings(rows, seen) {
+  let expired = 0;
+  for (const row of rows) {
+    if (!row.source_product_id || seen.has(row.source_product_id)) continue;
+    const count = Number(row.missing_observation_count || 0) + 1;
+    const withdrawn = count >= config.missingObservationsBeforeExpiry;
+    const write = await supabase.from("savings_rate_deals").update({
+      missing_observation_count: count,
+      lifecycle_status: withdrawn ? "WITHDRAWN" : "PENDING_WITHDRAWAL",
+      status: withdrawn ? "expired" : row.status,
+      effective_to: withdrawn ? nowIso() : null,
+      updated_at: nowIso(),
+    }).eq("id", row.id);
+    throwIf(write.error);
+    if (withdrawn) expired++;
+  }
+  return expired;
+}
+
+async function markMissingMortgages(rows, seen) {
+  let expired = 0;
+  for (const row of rows) {
+    if (!row.external_product_key || seen.has(row.external_product_key)) continue;
+    const count = Number(row.missing_observation_count || 0) + 1;
+    const withdrawn = count >= config.missingObservationsBeforeExpiry;
+    const write = await supabase.from("mortgage_rate_deals").update({
+      missing_observation_count: count,
+      catalogue_status: withdrawn ? "removed" : "pending_withdrawal",
+      status: withdrawn ? "expired" : row.status,
+      removed_detected_at: withdrawn ? nowIso() : null,
+      updated_at: nowIso(),
+    }).eq("id", row.id);
+    throwIf(write.error);
+    if (withdrawn) expired++;
+  }
+  return expired;
+}
+
+async function createRunLog(jobKind) {
+  const result = await supabase.from("wealth_watch_source_jobs").insert({
+    job_kind: jobKind,
     source_url: null,
     status: "running",
-    result_payload: { run_key: runKey, triggered_by: "render_direct_database_worker" },
-  };
-  const result = await supabase.from("wealth_watch_source_jobs").insert(payload).select("id").single();
+    result_payload: { run_key: runKey, triggered_by: "render_direct_database_worker_v2" },
+  }).select("id").single();
   if (result.error) {
-    log("run_log_unavailable", { table: "wealth_watch_source_jobs", error: result.error.message });
+    log("run_log_unavailable", { jobKind, error: result.error.message });
     return null;
   }
   return result.data?.id || null;
 }
 
-async function finishRunLog(id, status, resultPayload, error) {
+async function finishRunLog(id, status, resultPayload) {
   if (!id) return;
   const result = await supabase.from("wealth_watch_source_jobs").update({
     status,
-    updated_at: new Date().toISOString(),
+    updated_at: nowIso(),
     result_payload: resultPayload,
-    error,
+    error: resultPayload.failed ? `${resultPayload.failed} source(s) require retry` : null,
   }).eq("id", id);
   if (result.error) log("run_log_finish_failed", { error: result.error.message });
 }
 
+async function markSourceSuccess(table, id, count, hash) {
+  const timestamp = nowIso();
+  const values = { last_checked_at: timestamp, last_success_at: timestamp, last_error: null, status: "active", updated_at: timestamp };
+  if (table === "savings_rate_sources") values.last_result_payload = { parsed_deals: count, raw_hash: hash, run_key: runKey };
+  let result = await supabase.from(table).update(values).eq("id", id);
+  if (result.error && "last_result_payload" in values) {
+    delete values.last_result_payload;
+    result = await supabase.from(table).update(values).eq("id", id);
+  }
+  throwIf(result.error);
+}
+
+async function markSourceFailure(table, id, error) {
+  // Do not advance last_checked_at on failure: the source remains due for the next run.
+  const result = await supabase.from(table).update({
+    last_error: messageOf(error).slice(0, 1500),
+    status: "needs_review",
+    updated_at: nowIso(),
+  }).eq("id", id);
+  if (result.error) log("source_failure_write_failed", { table, id, error: result.error.message });
+}
+
+async function selectRows(table, fields, amend) {
+  const query = amend(supabase.from(table).select(fields));
+  const { data, error } = await query;
+  throwIf(error);
+  return data || [];
+}
+
 async function fetchSource(url) {
   const safe = new URL(url);
-  if (!["http:", "https:"].includes(safe.protocol)) throw new Error("Only HTTP and HTTPS source URLs are supported.");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs);
-  try {
-    const response = await fetch(safe, {
-      headers: {
-        "user-agent": config.userAgent,
-        accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5",
-      },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`Source returned HTTP ${response.status}`);
-    const raw = (await response.text()).slice(0, 750_000);
-    return {
-      url: response.url || safe.toString(),
-      text: stripHtml(raw).slice(0, 300_000),
-      hash: crypto.createHash("sha256").update(raw).digest("hex"),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function parseDeals({ providerName, providerSlug, productHint, sourceUrl, text }) {
-  const windows = collectRateWindows(text);
-  const candidates = windows.map((window) => parseWindow(window, { providerName, providerSlug, productHint, sourceUrl })).filter(Boolean);
-  const deduped = new Map();
-  for (const item of candidates) {
-    const key = `${item.provider_slug}|${item.product_name.toLowerCase()}|${item.gross_aer}`;
-    const current = deduped.get(key);
-    if (!current || item.confidence > current.confidence) deduped.set(key, item);
-  }
-  return [...deduped.values()].slice(0, 50);
-}
-
-function collectRateWindows(text) {
-  const compact = text.replace(/\s+/g, " ").trim();
-  const regex = /(?:\b\d{1,2}(?:\.\d{1,3})?\s*%\s*(?:AER|gross|variable|fixed)?|(?:AER|gross)\s*(?:rate)?\s*[:\-]?\s*\d{1,2}(?:\.\d{1,3})?\s*%)/gi;
-  const windows = [];
-  let match;
-  while ((match = regex.exec(compact))) {
-    const start = Math.max(0, match.index - 220);
-    const end = Math.min(compact.length, match.index + match[0].length + 260);
-    windows.push(compact.slice(start, end));
-    if (windows.length >= 100) break;
-  }
-  return windows;
-}
-
-function parseWindow(window, base) {
-  const rateMatch = window.match(/(\d{1,2}(?:\.\d{1,3})?)\s*%\s*(?:AER|gross)?/i) || window.match(/(?:AER|gross)\s*(?:rate)?\s*[:\-]?\s*(\d{1,2}(?:\.\d{1,3})?)\s*%/i);
-  if (!rateMatch) return null;
-  const grossAer = Number(rateMatch[1]);
-  if (!Number.isFinite(grossAer) || grossAer <= 0 || grossAer > 25) return null;
-
-  const lower = window.toLowerCase();
-  const accountType = lower.includes("cash isa") || /\bisa\b/.test(lower)
-    ? "cash_isa"
-    : lower.includes("regular saver") || lower.includes("monthly saver")
-      ? "regular_saver"
-      : lower.includes("notice")
-        ? "notice_saver"
-        : lower.includes("fixed") || lower.includes("bond")
-          ? "fixed_saver"
-          : "easy_access";
-  const accessType = accountType === "fixed_saver" ? "fixed_term" : accountType === "notice_saver" ? "notice" : accountType === "regular_saver" ? "regular_saver" : "easy_access";
-  const productName = inferProductName(window, base.productHint, accountType);
-  const minimumBalance = moneyAfter(window, /(?:minimum|min)\s+(?:opening\s+)?(?:deposit|balance)?\s*[:\-]?/i);
-  const maximumBalance = moneyAfter(window, /(?:maximum|max)\s+(?:deposit|balance)?\s*[:\-]?/i);
-  const monthlyMaxDeposit = moneyAfter(window, /(?:monthly|max(?:imum)?\s+monthly)\s+(?:deposit|save)?\s*[:\-]?/i);
-  const noticePeriodDays = numberBefore(window, /day(?:s)?\s+notice/i);
-  const termLengthMonths = inferTermMonths(window);
-  const requiresExistingCustomer = /existing customer|current account customer|members only|member exclusive/i.test(window);
-  let confidence = 68;
-  if (/AER/i.test(window)) confidence += 10;
-  if (base.productHint) confidence += 8;
-  if (/easy access|instant access|cash isa|fixed rate|fixed term|regular saver|notice account|bond/i.test(window)) confidence += 8;
-  if (minimumBalance !== null || maximumBalance !== null || termLengthMonths !== null) confidence += 4;
-  confidence = Math.min(99, confidence);
-
-  return {
-    provider_slug: normaliseSlug(base.providerSlug || base.providerName),
-    provider_name: base.providerName,
-    product_name: productName,
-    account_type: accountType,
-    gross_aer: grossAer,
-    bonus_rate: extractBonus(window),
-    minimum_balance: minimumBalance,
-    maximum_balance: maximumBalance,
-    monthly_max_deposit: monthlyMaxDeposit,
-    access_type: accessType,
-    withdrawal_rules: inferWithdrawalRules(window),
-    notice_period_days: noticePeriodDays,
-    term_length_months: termLengthMonths,
-    rate_type: /fixed/i.test(window) ? "fixed" : "variable",
-    requires_existing_customer: requiresExistingCustomer,
-    eligible_provider_slug: requiresExistingCustomer ? normaliseSlug(base.providerSlug || base.providerName) : null,
-    eligibility_note: requiresExistingCustomer ? "Existing-customer eligibility detected on source page." : null,
-    source_url: base.sourceUrl,
-    confidence,
-    ai_summary: `${base.providerName} ${productName} detected at ${grossAer.toFixed(2)}% AER from the configured source page.`,
-  };
-}
-
-function inferProductName(window, hint, accountType) {
-  if (hint?.trim()) return hint.trim().slice(0, 180);
-  const phrases = [
-    /([A-Z][A-Za-z0-9&'’\- ]{3,80}(?:Cash ISA|ISA|Regular Saver|Monthly Saver|Easy Access|Instant Access|Notice Account|Fixed Rate Bond|Fixed Saver|Savings Account))/,
-    /([A-Z][A-Za-z0-9&'’\- ]{3,80}(?:Saver|Savings|Bond))/,
-  ];
-  for (const regex of phrases) {
-    const found = window.match(regex)?.[1]?.replace(/\s+/g, " ").trim();
-    if (found) return found.slice(0, 180);
-  }
-  return ({ cash_isa: "Cash ISA", regular_saver: "Regular Saver", notice_saver: "Notice Savings", fixed_saver: "Fixed Savings", easy_access: "Easy Access Savings" })[accountType] || "Savings Product";
+  if (!["http:", "https:"].includes(safe.protocol)) throw new Error("Only HTTP and HTTPS source URLs are supported");
+  const response = await fetch(safe, {
+    headers: { "user-agent": config.userAgent, accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(config.fetchTimeoutMs),
+  });
+  if (!response.ok) throw new Error(`Source returned HTTP ${response.status}`);
+  const raw = (await response.text()).slice(0, 1_000_000);
+  const text = stripHtml(raw).slice(0, 400_000);
+  if (text.length < 120) throw new Error("Source returned too little readable content");
+  return { url: response.url || safe.toString(), text, hash: crypto.createHash("sha256").update(raw).digest("hex") };
 }
 
 function stripHtml(input) {
-  return input
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;|&#160;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&pound;|&#163;/gi, "£")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/\s+/g, " ")
-    .trim();
+  return input.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<noscript[\s\S]*?<\/noscript>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;|&#160;/gi, " ").replace(/&amp;/gi, "&").replace(/&pound;|&#163;/gi, "£").replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/\s+/g, " ").trim();
 }
 
-function moneyAfter(text, prefixRegex) {
-  const match = text.match(new RegExp(`${prefixRegex.source}\\s*£?([0-9][0-9,]*(?:\\.[0-9]{1,2})?)`, "i"));
-  return match ? Number(match[1].replace(/,/g, "")) : null;
+function baseSummary(sourceCount) {
+  return { sourceCount, checked: sourceCount, inserted: 0, updated: 0, expired: 0, failed: 0, dealsParsed: 0, detail: [] };
 }
-
-function numberBefore(text, suffixRegex) {
-  const match = text.match(new RegExp(`(\\d{1,4})\\s*${suffixRegex.source}`, "i"));
-  return match ? Number(match[1]) : null;
+function londonParts(date = new Date()) {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/London", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(date).reduce((acc, part) => ({ ...acc, [part.type]: part.value }), {});
 }
-
-function inferTermMonths(text) {
-  const month = text.match(/(\d{1,3})\s*month/i);
-  if (month) return Number(month[1]);
-  const year = text.match(/(\d{1,2})\s*year/i);
-  return year ? Number(year[1]) * 12 : null;
-}
-
-function extractBonus(text) {
-  const match = text.match(/bonus(?: rate)?\s*(?:of|:|-)?\s*(\d{1,2}(?:\.\d{1,3})?)\s*%/i);
-  return match ? Number(match[1]) : null;
-}
-
-function inferWithdrawalRules(text) {
-  if (/no withdrawals|withdrawals? not permitted/i.test(text)) return "No withdrawals during the term.";
-  if (/limited withdrawals|up to \d+ withdrawals/i.test(text)) return "Limited withdrawals; see source terms.";
-  if (/easy access|instant access|unlimited withdrawals/i.test(text)) return "Easy-access withdrawals detected; confirm provider conditions.";
-  return null;
-}
-
-function normaliseSlug(value) {
-  return String(value || "provider").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100);
-}
-
-function required(key) {
-  const value = process.env[key]?.trim();
-  if (!value) throw new Error(`Missing required environment variable: ${key}`);
-  return value;
-}
-function bool(key, fallback) {
-  const raw = process.env[key];
-  return raw == null ? fallback : /^(1|true|yes|on)$/i.test(raw);
-}
-function int(key, fallback, min, max) {
-  const parsed = Number.parseInt(process.env[key] || "", 10);
-  const value = Number.isFinite(parsed) ? parsed : fallback;
-  return Math.max(min, Math.min(max, value));
-}
-function log(event, payload) {
-  console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...payload }));
-}
+function hostname(url) { try { return new URL(url).hostname; } catch { return null; } }
+function nowIso() { return new Date().toISOString(); }
+function messageOf(error) { return error instanceof Error ? error.message : String(error); }
+function throwIf(error) { if (error) throw new Error(error.message || String(error)); }
+function required(key) { const value = process.env[key]?.trim(); if (!value) throw new Error(`Missing required environment variable: ${key}`); return value; }
+function bool(key, fallback) { const raw = process.env[key]; return raw == null ? fallback : /^(1|true|yes|on)$/i.test(raw); }
+function int(key, fallback, min, max) { const parsed = Number.parseInt(process.env[key] || "", 10); const value = Number.isFinite(parsed) ? parsed : fallback; return Math.max(min, Math.min(max, value)); }
+function log(event, payload) { console.log(JSON.stringify({ timestamp: nowIso(), event, ...payload })); }

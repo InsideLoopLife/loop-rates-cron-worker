@@ -1,6 +1,6 @@
 services:
   - type: cron
-    name: loop-rates-database-worker
+    name: loop-rates-and-maintenance-worker
     runtime: node
     plan: starter
     branch: main
@@ -18,11 +18,25 @@ services:
         value: "false"
       - key: SOURCE_LIMIT
         value: "40"
+      - key: SAVINGS_SOURCE_LIMIT
+        value: "40"
+      - key: MORTGAGE_SOURCE_LIMIT
+        value: "40"
       - key: FRESHNESS_HOURS
         value: "20"
       - key: PUBLISH_CONFIDENCE_THRESHOLD
         value: "92"
+      - key: MORTGAGE_PUBLISH_CONFIDENCE_THRESHOLD
+        value: "95"
+      - key: MISSING_OBSERVATIONS_BEFORE_EXPIRY
+        value: "3"
       - key: FETCH_TIMEOUT_MS
         value: "15000"
       - key: USER_AGENT
-        value: "LOOP rates catalogue worker/1.0"
+        value: "LOOP rates catalogue worker/2.0"
+      - key: RUN_APP_MAINTENANCE
+        value: "true"
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
