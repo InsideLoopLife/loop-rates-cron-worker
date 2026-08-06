@@ -14,7 +14,7 @@ const config = {
   mortgagePublishThreshold: int("MORTGAGE_PUBLISH_CONFIDENCE_THRESHOLD", 95, 75, 100),
   missingObservationsBeforeExpiry: int("MISSING_OBSERVATIONS_BEFORE_EXPIRY", 3, 2, 10),
   fetchTimeoutMs: int("FETCH_TIMEOUT_MS", 15000, 3000, 60000),
-  userAgent: process.env.USER_AGENT || "LOOP rates catalogue worker/2.0",
+  userAgent: process.env.USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
   appBaseUrl: process.env.APP_BASE_URL?.replace(/\/+$/, "") || null,
   cronSecret: process.env.CRON_SECRET?.trim() || null,
   runAppMaintenance: bool("RUN_APP_MAINTENANCE", true),
@@ -461,7 +461,14 @@ async function fetchSource(url) {
   const safe = new URL(url);
   if (!["http:", "https:"].includes(safe.protocol)) throw new Error("Only HTTP and HTTPS source URLs are supported");
   const response = await fetch(safe, {
-    headers: { "user-agent": config.userAgent, accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5" },
+    headers: {
+      "user-agent": config.userAgent,
+      accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5",
+      "accept-language": "en-GB,en;q=0.9",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-dest": "document",
+      "upgrade-insecure-requests": "1",
+    },
     redirect: "follow",
     signal: AbortSignal.timeout(config.fetchTimeoutMs),
   });
