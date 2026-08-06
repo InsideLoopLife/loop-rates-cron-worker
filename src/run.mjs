@@ -81,8 +81,20 @@ async function refreshSavings() {
         seen.add(sourceProductId);
         const prior = existingByKey.get(sourceProductId);
         const publishable = deal.publishable && deal.confidence >= config.publishThreshold;
+        // BUGFIX: `...deal` was spreading the parser's entire output onto
+        // the database row, including a top-level `validation` field that
+        // rates-parser.mjs sets on every deal (validation: { required,
+        // completeness }) — but no such column exists on
+        // savings_rate_deals. This is what caused every single savings
+        // source to fail with "Could not find the 'validation' column",
+        // consistently, regardless of any schema cache reload, because it
+        // was never a caching issue — the code was genuinely sending a
+        // field the table doesn't have. Destructuring it out here stops
+        // that leak; the data itself isn't lost, since a copy already
+        // lives safely nested inside source_payload.validation below.
+        const { validation: _validationNotAColumn, ...dealForRow } = deal;
         return {
-          ...deal,
+          ...dealForRow,
           status: prior?.status === "active" && publishable ? "active" : publishable ? "active" : "needs_review",
           detected_by: "render_direct_database_worker_v2",
           source_name: hostname(fetched.url),
