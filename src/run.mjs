@@ -36,9 +36,26 @@ const startedAt = new Date().toISOString();
 
 try {
   log("worker_started", { runKey, startedAt });
-  const savings = await refreshSavings();
-  const mortgages = await refreshMortgages();
-  const maintenance = config.runAppMaintenance ? await runAppMaintenance() : { skipped: true, reason: "RUN_APP_MAINTENANCE=false" };
+  // RESILIENCE: previously, an early failure in one phase (loadDueSources
+  // throwing on a transient Supabase connection issue, for example — the
+  // exact thing that just happened) would throw uncaught all the way out
+  // of this whole script, killing mortgages and maintenance too, even
+  // though neither had even started and both might have worked fine.
+  // Isolating each phase means one genuinely bad phase is reported
+  // honestly as failed, without taking the other two down with it.
+  async function isolatedPhase(name, run, fallback) {
+    try {
+      return await run();
+    } catch (error) {
+      log("phase_failed", { phase: name, error: messageOf(error) });
+      return fallback;
+    }
+  }
+  const savings = await isolatedPhase("savings", refreshSavings, { checked: 0, inserted: 0, updated: 0, expired: 0, failed: 1, dealsParsed: 0, detail: [{ ok: false, error: "Savings phase did not complete" }] });
+  const mortgages = await isolatedPhase("mortgages", refreshMortgages, { checked: 0, inserted: 0, updated: 0, expired: 0, failed: 1, dealsParsed: 0, detail: [{ ok: false, error: "Mortgages phase did not complete" }] });
+  const maintenance = config.runAppMaintenance
+    ? await isolatedPhase("maintenance", runAppMaintenance, { skipped: false, checked: 0, failed: 1, detail: [{ ok: false, error: "Maintenance phase did not complete" }] })
+    : { skipped: true, reason: "RUN_APP_MAINTENANCE=false" };
   const failed = savings.failed + mortgages.failed + (maintenance.failed || 0);
   const result = { ok: failed === 0, runKey, savings, mortgages, maintenance };
   log(failed ? "worker_completed_with_warnings" : "worker_succeeded", result);
@@ -80,7 +97,7 @@ async function refreshSavings() {
   });
   const summary = baseSummary(sources.length);
 
-  await mapWithConcurrency(sources, 6, async (source) => {
+  await mapWithConcurrency(sources, 4, async (source) => {
     try {
       const fetched = await fetchSource(source.source_url);
       const parsed = parseSavingsDeals({
@@ -185,7 +202,7 @@ async function refreshSavings() {
       // "is this already there?" agrees with what the database considers
       // a duplicate, instead of the original source_product_id key that
       // could disagree with it.
-      for (const row of dedupedRows) {
+      await mapWithConcurrency(dedupedRows, 3, async (row) => {
         const prior = existingByKey.get(compositeKey(row));
         let write = prior
           ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
@@ -215,12 +232,12 @@ async function refreshSavings() {
             write = await supabase.from("savings_rate_deals").update(row).eq("id", conflict.data.id).select("id").single();
             throwIf(write.error);
             summary.updated++;
-            continue;
+            return;
           }
         }
         throwIf(write.error);
         prior ? summary.updated++ : summary.inserted++;
-      }
+      });
       summary.expired += await markMissingSavings(existingRows, seen);
       summary.dealsParsed += parsed.length;
       await markSourceSuccess("savings_rate_sources", source.id, parsed.length, fetched.hash);
@@ -244,7 +261,7 @@ async function refreshMortgages() {
   });
   const summary = baseSummary(sources.length);
 
-  await mapWithConcurrency(sources, 6, async (source) => {
+  await mapWithConcurrency(sources, 4, async (source) => {
     try {
       const fetched = await fetchSource(source.source_url);
       const market = await currentMortgageMarket();
@@ -263,7 +280,7 @@ async function refreshMortgages() {
       const existingByKey = new Map(existingRows.map((row) => [row.external_product_key, row]));
       const seen = new Set();
 
-      for (const deal of parsed) {
+      await mapWithConcurrency(parsed, 3, async (deal) => {
         seen.add(deal.external_product_key);
         const prior = existingByKey.get(deal.external_product_key);
         const publishable = deal.publishable && deal.confidence >= config.mortgagePublishThreshold;
@@ -307,7 +324,7 @@ async function refreshMortgages() {
           : await supabase.from("mortgage_rate_deals").insert(row).select("id").single();
         throwIf(write.error);
         prior ? summary.updated++ : summary.inserted++;
-      }
+      });
       summary.expired += await markMissingMortgages(existingRows, seen);
       summary.dealsParsed += parsed.length;
       await markSourceSuccess("mortgage_lender_sources", source.id, parsed.length, fetched.hash);
@@ -355,7 +372,7 @@ async function runAppMaintenance() {
   // infrastructure, not external sites, so there's no reason not to run
   // them all at once — worst case becomes whatever the single slowest
   // endpoint takes, not the sum of all of them.
-  await mapWithConcurrency(paths, paths.length, async (path) => {
+  await mapWithConcurrency(paths, 5, async (path) => {
     try {
       const response = await fetch(`${config.appBaseUrl}${path}`, {
         headers: { authorization: `Bearer ${config.cronSecret}`, "x-loop-worker": "rates-database-worker-v2" },
