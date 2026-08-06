@@ -50,6 +50,27 @@ try {
   process.exitCode = 1;
 }
 
+// PERFORMANCE: all three main loops (savings sources, mortgage sources, and
+// the 13 own-app maintenance calls) previously ran one item at a time,
+// fully sequentially. With each item having its own generous timeout
+// (15s per external source, 120s per maintenance call), a run where
+// several items are genuinely slow could stack up to a very long total
+// duration even though nothing was actually stuck — this is the concrete,
+// code-level explanation for runs taking far longer than the usual 1-3
+// minutes. Processing a bounded number of items concurrently keeps the
+// same per-item timeout and error handling, but means the total run time
+// is governed by the slowest item in a batch, not the sum of every item.
+async function mapWithConcurrency(items, limit, worker) {
+  let index = 0;
+  async function runOne() {
+    while (index < items.length) {
+      const current = index++;
+      await worker(items[current], current);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runOne));
+}
+
 async function refreshSavings() {
   const job = await createRunLog("savings_catalogue_refresh");
   const sources = await loadDueSources({
@@ -59,7 +80,7 @@ async function refreshSavings() {
   });
   const summary = baseSummary(sources.length);
 
-  for (const source of sources) {
+  await mapWithConcurrency(sources, 6, async (source) => {
     try {
       const fetched = await fetchSource(source.source_url);
       const parsed = parseSavingsDeals({
@@ -209,7 +230,7 @@ async function refreshSavings() {
       await markSourceFailure("savings_rate_sources", source.id, error);
       summary.detail.push({ sourceId: source.id, provider: source.provider_name, ok: false, error: messageOf(error) });
     }
-  }
+  });
   await finishRunLog(job, "completed", summary);
   return summary;
 }
@@ -223,7 +244,7 @@ async function refreshMortgages() {
   });
   const summary = baseSummary(sources.length);
 
-  for (const source of sources) {
+  await mapWithConcurrency(sources, 6, async (source) => {
     try {
       const fetched = await fetchSource(source.source_url);
       const market = await currentMortgageMarket();
@@ -296,7 +317,7 @@ async function refreshMortgages() {
       await markSourceFailure("mortgage_lender_sources", source.id, error);
       summary.detail.push({ sourceId: source.id, lender: source.lender_name, ok: false, error: messageOf(error) });
     }
-  }
+  });
   await finishRunLog(job, "completed", summary);
   return summary;
 }
@@ -324,7 +345,17 @@ async function runAppMaintenance() {
   ];
   if (new Date().getUTCDay() === 1) paths.push("/api/cron/weekly-digest");
   const detail = [];
-  for (const path of paths) {
+  // PERFORMANCE: this was the single biggest contributor to runs taking
+  // far longer than usual — 13 (14 on Mondays) sequential calls to our
+  // own app, each with a 120s timeout, meant a genuinely slow app
+  // response (confirmed happening before — investment-pension-snapshot
+  // alone took 84s in one earlier run) could push total maintenance time
+  // toward 20+ minutes on top of whatever savings/mortgages already took.
+  // These endpoints are independent of each other and hit our own
+  // infrastructure, not external sites, so there's no reason not to run
+  // them all at once — worst case becomes whatever the single slowest
+  // endpoint takes, not the sum of all of them.
+  await mapWithConcurrency(paths, paths.length, async (path) => {
     try {
       const response = await fetch(`${config.appBaseUrl}${path}`, {
         headers: { authorization: `Bearer ${config.cronSecret}`, "x-loop-worker": "rates-database-worker-v2" },
@@ -336,7 +367,7 @@ async function runAppMaintenance() {
     } catch (error) {
       detail.push({ path, ok: false, error: messageOf(error) });
     }
-  }
+  });
   return { skipped: false, checked: paths.length, failed: detail.filter((row) => !row.ok).length, detail };
 }
 
