@@ -71,15 +71,27 @@ async function refreshSavings() {
       });
       if (!parsed.length) throw new Error("No coherent savings products found; source requires review");
 
-      const existingRows = await selectRows("savings_rate_deals", "id,source_product_id,status,lifecycle_status,missing_observation_count,source_payload,gross_aer,verification_status,source_url", (q) =>
+      const existingRows = await selectRows("savings_rate_deals", "id,source_product_id,status,lifecycle_status,missing_observation_count,source_payload,gross_aer,verification_status,source_url,provider_slug,product_name", (q) =>
         q.eq("canonical_source", String(source.id))
       );
-      const existingByKey = new Map(existingRows.map((row) => [row.source_product_id, row]));
+      // BUGFIX (part 2): the database's real uniqueness rule is a PARTIAL
+      // index on (provider_slug, product_name, source_url) — a plain
+      // Supabase upsert can't target a partial index by column list alone
+      // (Postgres needs the exact WHERE predicate too, which the
+      // supabase-js upsert syntax doesn't expose), which is why trying
+      // that produced "no unique or exclusion constraint matching the ON
+      // CONFLICT specification" for every single source. The safer fix:
+      // go back to a manual insert-vs-update decision, but key it on the
+      // SAME fields the database actually checks, instead of
+      // source_product_id — so "is this already there?" agrees with what
+      // the database itself considers a duplicate.
+      const compositeKey = (row) => `${row.provider_slug || ""}|${row.product_name || ""}|${row.source_url || ""}`;
+      const existingByKey = new Map(existingRows.map((row) => [compositeKey(row), row]));
       const seen = new Set();
       const rows = parsed.map((deal) => {
         const sourceProductId = deal.source_product_id;
         seen.add(sourceProductId);
-        const prior = existingByKey.get(sourceProductId);
+        const prior = existingByKey.get(compositeKey(deal));
         const publishable = deal.publishable && deal.confidence >= config.publishThreshold;
         // BUGFIX: `...deal` was spreading the parser's entire output onto
         // the database row, including a top-level `validation` field that
@@ -120,25 +132,23 @@ async function refreshSavings() {
         };
       });
 
-      // BUGFIX: the database's real uniqueness constraint is on
-      // (provider_slug, product_name, source_url) — but the insert/update
-      // decision above was keyed on source_product_id, a different field
-      // entirely. If the parser ever generates a different
-      // source_product_id for what is, by the database's own definition,
-      // the same real product (same provider, same product name, same
-      // source URL), the code thought it was new, attempted a plain
-      // insert, and collided with the actual constraint — exactly what
-      // "duplicate key value violates unique constraint" was reporting.
-      // Upserting against the real constraint columns makes this correct
-      // and idempotent regardless of what source_product_id shows up.
+      // BUGFIX, corrected: the database's real uniqueness rule is a
+      // PARTIAL index on (provider_slug, product_name, source_url) — a
+      // plain PostgREST upsert can't target a partial index by column
+      // list alone (confirmed directly: attempting this produced "no
+      // unique or exclusion constraint matching the ON CONFLICT
+      // specification" for every source). The correct fix is a manual
+      // insert-vs-update decision, same shape as the original code, but
+      // keyed on the SAME fields the database actually checks — so
+      // "is this already there?" agrees with what the database considers
+      // a duplicate, instead of the original source_product_id key that
+      // could disagree with it.
       for (const row of rows) {
-        const write = await supabase
-          .from("savings_rate_deals")
-          .upsert(row, { onConflict: "provider_slug,product_name,source_url" })
-          .select("id")
-          .single();
+        const prior = existingByKey.get(compositeKey(row));
+        const write = prior
+          ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
+          : await supabase.from("savings_rate_deals").insert(row).select("id").single();
         throwIf(write.error);
-        const prior = existingByKey.get(row.source_product_id);
         prior ? summary.updated++ : summary.inserted++;
       }
       summary.expired += await markMissingSavings(existingRows, seen);
