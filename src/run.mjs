@@ -166,9 +166,37 @@ async function refreshSavings() {
       // could disagree with it.
       for (const row of dedupedRows) {
         const prior = existingByKey.get(compositeKey(row));
-        const write = prior
+        let write = prior
           ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
           : await supabase.from("savings_rate_deals").insert(row).select("id").single();
+        // BUGFIX (part 4, the remaining narrow case): the database's real
+        // uniqueness rule is GLOBAL across all sources — but the
+        // existence check above only looks at rows already tied to THIS
+        // source's canonical_source. If the same real product legitimately
+        // gets picked up by two different sources (an aggregator like
+        // Moneyfacts overlapping with a bank's own direct listing, for
+        // example), the scoped check can't see it, and a plain insert
+        // collides with the database's own, correctly global, constraint.
+        // Rather than restructure how existingRows is fetched, this
+        // self-heals: on exactly this error, look up the real conflicting
+        // row with no source scoping at all, and update it instead of
+        // failing the whole source over what is, in the database's own
+        // terms, not actually a new product.
+        if (write.error?.code === "23505") {
+          const conflict = await supabase
+            .from("savings_rate_deals")
+            .select("id")
+            .eq("provider_slug", row.provider_slug)
+            .eq("product_name", row.product_name)
+            .eq("source_url", row.source_url)
+            .maybeSingle();
+          if (conflict.data?.id) {
+            write = await supabase.from("savings_rate_deals").update(row).eq("id", conflict.data.id).select("id").single();
+            throwIf(write.error);
+            summary.updated++;
+            continue;
+          }
+        }
         throwIf(write.error);
         prior ? summary.updated++ : summary.inserted++;
       }
