@@ -132,6 +132,27 @@ async function refreshSavings() {
         };
       });
 
+      // BUGFIX (part 3, a genuinely different case from parts 1 and 2):
+      // the previous fix correctly compares against rows already in the
+      // database, but doesn't protect against two deals extracted from
+      // the SAME page, in the SAME run, sharing the same real-world
+      // identity (provider_slug + product_name + source_url) — the same
+      // account mentioned in two places on one page, for example. The
+      // first one inserts fine; the second collides with what the first
+      // just created, since the in-memory existingByKey snapshot was only
+      // built once, before this loop started. Deduping the batch itself
+      // first — keeping the highest-confidence extraction when there's a
+      // genuine clash — closes this without needing to touch the database
+      // mid-loop.
+      const dedupedRows = Array.from(
+        rows.reduce((map, row) => {
+          const key = compositeKey(row);
+          const existing = map.get(key);
+          if (!existing || Number(row.confidence || 0) > Number(existing.confidence || 0)) map.set(key, row);
+          return map;
+        }, new Map()).values()
+      );
+
       // BUGFIX, corrected: the database's real uniqueness rule is a
       // PARTIAL index on (provider_slug, product_name, source_url) — a
       // plain PostgREST upsert can't target a partial index by column
@@ -143,7 +164,7 @@ async function refreshSavings() {
       // "is this already there?" agrees with what the database considers
       // a duplicate, instead of the original source_product_id key that
       // could disagree with it.
-      for (const row of rows) {
+      for (const row of dedupedRows) {
         const prior = existingByKey.get(compositeKey(row));
         const write = prior
           ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
