@@ -120,12 +120,25 @@ async function refreshSavings() {
         };
       });
 
+      // BUGFIX: the database's real uniqueness constraint is on
+      // (provider_slug, product_name, source_url) — but the insert/update
+      // decision above was keyed on source_product_id, a different field
+      // entirely. If the parser ever generates a different
+      // source_product_id for what is, by the database's own definition,
+      // the same real product (same provider, same product name, same
+      // source URL), the code thought it was new, attempted a plain
+      // insert, and collided with the actual constraint — exactly what
+      // "duplicate key value violates unique constraint" was reporting.
+      // Upserting against the real constraint columns makes this correct
+      // and idempotent regardless of what source_product_id shows up.
       for (const row of rows) {
-        const prior = existingByKey.get(row.source_product_id);
-        const write = prior
-          ? await supabase.from("savings_rate_deals").update(row).eq("id", prior.id).select("id").single()
-          : await supabase.from("savings_rate_deals").insert(row).select("id").single();
+        const write = await supabase
+          .from("savings_rate_deals")
+          .upsert(row, { onConflict: "provider_slug,product_name,source_url" })
+          .select("id")
+          .single();
         throwIf(write.error);
+        const prior = existingByKey.get(row.source_product_id);
         prior ? summary.updated++ : summary.inserted++;
       }
       summary.expired += await markMissingSavings(existingRows, seen);
