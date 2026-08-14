@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { parseMortgageDeals, parseSavingsDeals } from "./rates-parser.mjs";
+import { refreshBoeBenchmarks } from "./boe-benchmarks.mjs";
 
 const config = {
   supabaseUrl: required("SUPABASE_URL"),
@@ -53,11 +54,17 @@ try {
   }
   const savings = await isolatedPhase("savings", refreshSavings, { checked: 0, inserted: 0, updated: 0, expired: 0, failed: 1, dealsParsed: 0, detail: [{ ok: false, error: "Savings phase did not complete" }] });
   const mortgages = await isolatedPhase("mortgages", refreshMortgages, { checked: 0, inserted: 0, updated: 0, expired: 0, failed: 1, dealsParsed: 0, detail: [{ ok: false, error: "Mortgages phase did not complete" }] });
+  // BoE benchmarks only need refreshing monthly (that's how often BoE publishes),
+  // but running it every day this worker runs is harmless — upsert on
+  // (series_code, effective_month) means re-running mid-month just no-ops until
+  // the month rolls over. Isolated the same way as the other phases so a BoE
+  // outage can't take down savings/mortgages, which matter far more day-to-day.
+  const boeBenchmarks = await isolatedPhase("boeBenchmarks", () => refreshBoeBenchmarks(supabase, config.userAgent), { checked: 0, inserted: 0, updated: 0, failed: 1, skippedSeries: [], detail: [{ ok: false, error: "BoE benchmark phase did not complete" }] });
   const maintenance = config.runAppMaintenance
     ? await isolatedPhase("maintenance", runAppMaintenance, { skipped: false, checked: 0, failed: 1, detail: [{ ok: false, error: "Maintenance phase did not complete" }] })
     : { skipped: true, reason: "RUN_APP_MAINTENANCE=false" };
-  const failed = savings.failed + mortgages.failed + (maintenance.failed || 0);
-  const result = { ok: failed === 0, runKey, savings, mortgages, maintenance };
+  const failed = savings.failed + mortgages.failed + boeBenchmarks.failed + (maintenance.failed || 0);
+  const result = { ok: failed === 0, runKey, savings, mortgages, boeBenchmarks, maintenance };
   log(failed ? "worker_completed_with_warnings" : "worker_succeeded", result);
   // Individual provider failures are reported and retried next run. A partial provider
   // outage must not make Render treat an otherwise useful catalogue refresh as crashed.
