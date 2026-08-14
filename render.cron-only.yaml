@@ -1,0 +1,141 @@
+services:
+  - type: cron
+    name: loop-savings-catalogue-and-rate-watch
+    runtime: node
+    plan: starter
+    schedule: "0 7,8 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-savings-rate-watch.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: SAVINGS_WATCH_MODE
+        value: full
+      - key: SAVINGS_WATCH_RUN_KIND
+        value: render_daily_8am_europe_london
+      - key: SAVINGS_WATCH_TIMEZONE
+        value: Europe/London
+      - key: SAVINGS_WATCH_ENFORCE_LOCAL_HOUR
+        value: "true"
+
+  - type: cron
+    name: loop-mortgage-catalogue-refresh
+    runtime: node
+    plan: starter
+    schedule: "20 5 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/mortgage-catalogue-refresh
+
+  - type: cron
+    name: loop-boe-benchmark-refresh
+    runtime: node
+    plan: starter
+    schedule: "0 6 1 * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/boe-benchmark-refresh
+
+  - type: cron
+    name: loop-mortgage-renewal-watch
+    runtime: node
+    plan: starter
+    schedule: "35 5 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/mortgage-renewal-watch
+
+  - type: cron
+    name: loop-daily-financial-snapshots
+    runtime: node
+    plan: starter
+    schedule: "50 23 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/daily-snapshot
+
+  - type: cron
+    name: loop-pensions-daily
+    runtime: node
+    plan: starter
+    schedule: "10 6 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/pensions-daily
+
+  - type: cron
+    name: loop-annual-pension-performance
+    runtime: node
+    plan: starter
+    schedule: "15 4 5 1 *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-pension-performance-refresh.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+
+  - type: cron
+    name: loop-loopwatch-daily
+    runtime: node
+    plan: starter
+    schedule: "30 7 * * *"
+    buildCommand: npm ci
+    startCommand: node scripts/run-loop-cron-endpoint.mjs
+    envVars:
+      - key: APP_BASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: LOOP_CRON_ENDPOINT
+        value: /api/cron/loopwatch-daily
+
+  - type: cron
+    name: loop-pension-fee-and-isin-refresh
+    runtime: node
+    plan: starter
+    schedule: "0 2 * * *"
+    buildCommand: npm ci
+    startCommand: npm run cron:fees
+    envVars:
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
