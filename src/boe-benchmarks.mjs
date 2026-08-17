@@ -27,6 +27,8 @@ const BOE_SERIES_CODES = [
   'IUMBV45', // 10yr fixed
   'IUMBV48', 'IUM2WDT', // 2yr variable / discounted variable
   'CFMBX2D', 'IUMTLMV', // SVR / revert-to-rate
+  'IUDBEDR', // Bank Rate itself — confirmed via BoE's own R package docs and an
+             // independent MCP server built specifically around this series code.
 ];
 
 // High-confidence fallback for the 5 series I could confirm precisely,
@@ -40,8 +42,17 @@ const CONFIRMED_2YR_FIXED_LTV_MAP = {
   IUM2WTL: 95,
 };
 
+// Same safety-net principle for Bank Rate — this is the single most important
+// series (everything else, including live SVR-spread calculations, depends on
+// it), so it shouldn't be able to silently fail just because its title text
+// doesn't match my regex guess.
+const CONFIRMED_TERM_TYPE_MAP = {
+  IUDBEDR: 'bank_rate',
+};
+
 function parseTermType(title) {
   const lower = title.toLowerCase();
+  if (/official bank rate|^bank rate/.test(lower)) return 'bank_rate';
   if (/standard variable|revert.?to.?rate/.test(lower)) return lower.includes('revert') ? 'revert_to_rate' : 'svr';
   if (/2.?year.*variable|2.?year.*discount/.test(lower)) return '2yr_variable';
   const fixedMatch = lower.match(/(\d+)\s*.?year.*fixed/);
@@ -82,6 +93,9 @@ function parseBoeCsv(dataCsv, seriesToTitle) {
       if (!termType && CONFIRMED_2YR_FIXED_LTV_MAP[seriesCode] !== undefined) {
         termType = '2yr_fixed';
         ltvTier = CONFIRMED_2YR_FIXED_LTV_MAP[seriesCode];
+      }
+      if (!termType && CONFIRMED_TERM_TYPE_MAP[seriesCode] !== undefined) {
+        termType = CONFIRMED_TERM_TYPE_MAP[seriesCode];
       }
       if (!termType) continue; // can't confidently classify — skip rather than guess
 

@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { parseMortgageDeals, parseSavingsDeals } from "./rates-parser.mjs";
 import { refreshBoeBenchmarks } from "./boe-benchmarks.mjs";
+import { refreshUserSubmittedProducts } from "./user-submitted-staleness.mjs";
 
 const config = {
   supabaseUrl: required("SUPABASE_URL"),
@@ -60,11 +61,20 @@ try {
   // the month rolls over. Isolated the same way as the other phases so a BoE
   // outage can't take down savings/mortgages, which matter far more day-to-day.
   const boeBenchmarks = await isolatedPhase("boeBenchmarks", () => refreshBoeBenchmarks(supabase, config.userAgent), { checked: 0, inserted: 0, updated: 0, failed: 1, skippedSeries: [], detail: [{ ok: false, error: "BoE benchmark phase did not complete" }] });
+  // 3-strikes staleness check for user-submitted product URLs. Isolated the
+  // same way — a bad run here (e.g. a spate of transient network errors)
+  // shouldn't be able to take down savings/mortgages/boeBenchmarks, and vice
+  // versa a failure elsewhere shouldn't stop deleted-deal notifications going out.
+  const userSubmittedProducts = await isolatedPhase(
+    "userSubmittedProducts",
+    () => refreshUserSubmittedProducts(supabase, config.userAgent, log),
+    { checked: 0, ok: 0, failed: 1, deleted: 0, notified: 0, detail: [{ ok: false, error: "User-submitted products phase did not complete" }] },
+  );
   const maintenance = config.runAppMaintenance
     ? await isolatedPhase("maintenance", runAppMaintenance, { skipped: false, checked: 0, failed: 1, detail: [{ ok: false, error: "Maintenance phase did not complete" }] })
     : { skipped: true, reason: "RUN_APP_MAINTENANCE=false" };
-  const failed = savings.failed + mortgages.failed + boeBenchmarks.failed + (maintenance.failed || 0);
-  const result = { ok: failed === 0, runKey, savings, mortgages, boeBenchmarks, maintenance };
+  const failed = savings.failed + mortgages.failed + boeBenchmarks.failed + userSubmittedProducts.failed + (maintenance.failed || 0);
+  const result = { ok: failed === 0, runKey, savings, mortgages, boeBenchmarks, userSubmittedProducts, maintenance };
   log(failed ? "worker_completed_with_warnings" : "worker_succeeded", result);
   // Individual provider failures are reported and retried next run. A partial provider
   // outage must not make Render treat an otherwise useful catalogue refresh as crashed.
