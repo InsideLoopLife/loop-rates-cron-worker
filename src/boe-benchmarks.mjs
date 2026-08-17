@@ -134,14 +134,30 @@ async function fetchBoeMortgageBenchmarks(userAgent) {
   const foundCodes = new Set(rows.map((r) => r.seriesCode));
   const skippedSeries = BOE_SERIES_CODES.filter((c) => !foundCodes.has(c));
 
-  return { rows, skippedSeries };
+  // DIAGNOSTICS — added because 14/15 series were silently missing from real
+  // output with no way to tell why (title parsing found nothing at all, not
+  // even for the series that DID work). This surfaces what BoE's response
+  // actually contained on the next run, instead of guessing again blind.
+  const headerRowLine = dataStart >= 0 ? csvText.slice(dataStart + 1).split('\n')[0] : dataCsv.split('\n')[0];
+  const headerColumnsFound = headerRowLine ? headerRowLine.split(',').map((h) => h.trim().replace(/^"|"$/g, '')) : [];
+  const requestedButAbsentFromHeader = BOE_SERIES_CODES.filter((c) => !headerColumnsFound.includes(c));
+  const diagnostics = {
+    dataStartFound: dataStart >= 0,
+    headerColumnsFound,
+    requestedButAbsentFromHeader, // if non-empty, BoE's response never included these columns at all —
+                                    // points at a request-side issue (too many codes, wrong param), not a parsing bug
+    csvTextLength: csvText.length,
+    csvTextFirst500Chars: csvText.slice(0, 500),
+  };
+
+  return { rows, skippedSeries, diagnostics };
 }
 
 export async function refreshBoeBenchmarks(supabase, userAgent) {
-  const { rows, skippedSeries } = await fetchBoeMortgageBenchmarks(userAgent);
+  const { rows, skippedSeries, diagnostics } = await fetchBoeMortgageBenchmarks(userAgent);
 
   if (!rows.length) {
-    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, detail: [{ ok: false, error: 'No benchmark rows parsed — BoE response format may have changed, or the fetch was blocked' }] };
+    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, diagnostics, detail: [{ ok: false, error: 'No benchmark rows parsed — BoE response format may have changed, or the fetch was blocked' }] };
   }
 
   const { error } = await supabase.from('mortgage_market_rate_benchmarks').upsert(
@@ -159,7 +175,7 @@ export async function refreshBoeBenchmarks(supabase, userAgent) {
   );
 
   if (error) {
-    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, detail: [{ ok: false, error: `Upsert failed: ${error.message}` }] };
+    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, diagnostics, detail: [{ ok: false, error: `Upsert failed: ${error.message}` }] };
   }
 
   return {
@@ -168,6 +184,7 @@ export async function refreshBoeBenchmarks(supabase, userAgent) {
     updated: 0,
     failed: skippedSeries.length,
     skippedSeries,
+    diagnostics,
     detail: [{ ok: true, rowsWritten: rows.length, skippedSeries }],
   };
 }
