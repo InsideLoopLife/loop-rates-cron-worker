@@ -1,6 +1,7 @@
 import { createFeatureCache } from "@/lib/wealth/watch-entitlements";
 import { loadWealthWatchSettings } from "@/lib/wealth/watch-settings";
 import { savingsDealEligibleBalance, savingsDealMatchesAccount } from "@/lib/wealth/savings-intelligence";
+import { ensureSavingsDealShadow } from "@/lib/wealth/savings-deal-shadow";
 
 export type SavingsWatchOptions = {
   runKey?: string;
@@ -14,13 +15,13 @@ function runKey(date = new Date()) {
   return `savings-rate-watch:${date.toISOString().slice(0, 10)}`;
 }
 
-export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOptions = {}) {
+export async function runSavingsRateWatch(supabase: any, ratesSupabase: any, options: SavingsWatchOptions = {}) {
   const settings = await loadWealthWatchSettings(supabase);
   const key = options.runKey || runKey();
   const limit = Math.max(1, Math.min(Number(options.limit || 500), 1000));
   const now = new Date().toISOString();
 
-  const { data: run, error: runError } = await supabase
+  const { data: run, error: runError } = await ratesSupabase
     .from("savings_rate_watch_runs")
     .upsert({
       run_key: key,
@@ -45,11 +46,11 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
     const [{ data: accounts, error: accountsError }, { data: deals, error: dealsError }, { data: relationships }] = await Promise.all([
       supabase
         .from("financial_accounts")
-        .select("id, user_id, name, provider, provider_slug, account_type, current_balance, interest_rate, monthly_top_up_amount, savings_watch_enabled")
+        .select("id, user_id, name, provider, provider_slug, account_type, current_balance, interest_rate, monthly_top_up_amount, savings_watch_enabled, owner_person_id, ownership_scope, savings_limit_scope, owner:people!financial_accounts_owner_person_id_fkey(id,relationship,birth_date)")
         .eq("is_liability", false)
         .neq("account_type", "current_account")
         .limit(limit),
-      supabase
+      ratesSupabase
         .from("savings_rate_deals")
         .select("id, provider_slug, provider_name, product_name, account_type, gross_aer, bonus_rate, minimum_balance, maximum_balance, monthly_min_deposit, monthly_max_deposit, requires_existing_customer, eligible_provider_slug, eligibility_note, access_type, withdrawal_rules, notice_period_days, term_length_months, rate_type, source_url, status, last_checked_at, confidence")
         .eq("status", "active")
@@ -65,6 +66,7 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
     if (dealsError) throw new Error(dealsError.message);
 
     const relationshipsByUser = new Map<string, Set<string>>();
+    const shadowedDealIds = new Set<string>();
     for (const rel of relationships || []) {
       const set = relationshipsByUser.get(rel.user_id) || new Set<string>();
       if (rel.provider_slug) set.add(String(rel.provider_slug));
@@ -72,6 +74,12 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
     }
 
     for (const account of accounts || []) {
+      const accountForMatching = {
+        ...account,
+        owner_is_child: String(account.owner?.relationship || "").toLowerCase() === "child",
+        owner_relationship: account.owner?.relationship || null,
+        owner_birth_date: account.owner?.birth_date || null,
+      };
       if (account.savings_watch_enabled === false) continue;
       // Basic daily matching is available to every saver. Tiers control alerts,
       // automation and advanced modelling, not whether a useful comparison exists.
@@ -90,7 +98,7 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
 
       for (const deal of deals || []) {
         if (createdForAccount >= settings.savingsMaxRecommendationsPerAccount) break;
-        if (!savingsDealMatchesAccount(account, deal)) continue;
+        if (!savingsDealMatchesAccount(accountForMatching, deal)) continue;
         const suggestedRate = Number(deal.gross_aer || 0);
         if (!suggestedRate || suggestedRate <= currentRate + settings.savingsMinimumRateDelta) continue;
         const needsExisting = Boolean(deal.requires_existing_customer);
@@ -99,7 +107,7 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
         if (!eligible) continue;
 
         const delta = suggestedRate - currentRate;
-        const eligibleBalance = savingsDealEligibleBalance(account, deal);
+        const eligibleBalance = savingsDealEligibleBalance(accountForMatching, deal);
         const isRegularSaver = String(deal.account_type || deal.access_type || "").toLowerCase().includes("regular");
         const monthlyAllowance = Number(deal.monthly_max_deposit || 0) > 0
           ? Math.min(monthlyTopUp, Number(deal.monthly_max_deposit))
@@ -111,7 +119,12 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
         const accessBits = [deal.access_type ? String(deal.access_type).replaceAll("_", " ") : null, deal.notice_period_days ? `${deal.notice_period_days} days notice` : null, deal.term_length_months ? `${deal.term_length_months} month term` : null, deal.withdrawal_rules ? String(deal.withdrawal_rules).slice(0, 140) : null].filter(Boolean).join(" · ");
         const reason = `${deal.provider_name || deal.provider_slug} is showing ${suggestedRate.toFixed(2)}% vs this account at ${currentRate.toFixed(2)}%. ${needsExisting ? "Included because you have marked the required provider as held." : "Included because it appears open-market rather than existing-customer only."}${accessBits ? ` Access: ${accessBits}.` : ""}`;
 
-        const { error } = await supabase.from("savings_rate_recommendations").upsert({
+        if (!shadowedDealIds.has(String(deal.id))) {
+          await ensureSavingsDealShadow(supabase, deal);
+          shadowedDealIds.add(String(deal.id));
+        }
+
+        const { error } = await ratesSupabase.from("savings_rate_recommendations").upsert({
           user_id: account.user_id,
           financial_account_id: account.id,
           savings_rate_deal_id: deal.id,
@@ -160,18 +173,45 @@ export async function runSavingsRateWatch(supabase: any, options: SavingsWatchOp
       await supabase.from("financial_accounts").update({ savings_last_recommendation_at: now }).eq("id", account.id);
     }
 
-    await supabase.from("savings_rate_watch_runs").update({ status: "completed", finished_at: new Date().toISOString(), accounts_checked: checked, recommendations_created: recommendations, payload: { detail: detail.slice(0, 100), skippedNoTier, settings } }).eq("id", run.id);
-    return { ok: true, checked, recommendations_created: recommendations, skipped_no_tier: skippedNoTier };
+    // Recommendations are persisted, so a matcher fix must also retire rows
+    // created by older code. Otherwise an adult can keep seeing a Junior ISA
+    // until it happens to be replaced by a later run.
+    const accountById = new Map<string, any>((accounts || []).map((account: any) => [String(account.id), account]));
+    const dealById = new Map<string, any>((deals || []).map((deal: any) => [String(deal.id), deal]));
+    const { data: activeRecommendations, error: activeRecommendationError } = await ratesSupabase
+      .from("savings_rate_recommendations")
+      .select("id,financial_account_id,savings_rate_deal_id")
+      .in("status", ["new", "seen", "watching"]);
+    if (activeRecommendationError) throw new Error(activeRecommendationError.message);
+    const invalidIds = (activeRecommendations || []).filter((recommendation: any) => {
+      const account = accountById.get(String(recommendation.financial_account_id || ""));
+      const deal = dealById.get(String(recommendation.savings_rate_deal_id || ""));
+      if (!account) return false;
+      if (!deal) return true;
+      return !savingsDealMatchesAccount({
+        ...account,
+        owner_is_child: String(account.owner?.relationship || "").toLowerCase() === "child",
+        owner_relationship: account.owner?.relationship || null,
+        owner_birth_date: account.owner?.birth_date || null,
+      }, deal);
+    }).map((recommendation: any) => recommendation.id);
+    if (invalidIds.length) {
+      const { error } = await ratesSupabase.from("savings_rate_recommendations").update({ status: "expired", updated_at: now }).in("id", invalidIds);
+      if (error) throw new Error(error.message);
+    }
+
+    await ratesSupabase.from("savings_rate_watch_runs").update({ status: "completed", finished_at: new Date().toISOString(), accounts_checked: checked, recommendations_created: recommendations, payload: { detail: detail.slice(0, 100), skippedNoTier, settings } }).eq("id", run.id);
+    return { ok: true, checked, recommendations_created: recommendations, invalid_recommendations_expired: invalidIds.length, skipped_no_tier: skippedNoTier };
   } catch (error: any) {
-    await supabase.from("savings_rate_watch_runs").update({ status: "failed", finished_at: new Date().toISOString(), accounts_checked: checked, recommendations_created: recommendations, error: error?.message || "failed", payload: { detail, skippedNoTier, settings } }).eq("id", run.id);
+    await ratesSupabase.from("savings_rate_watch_runs").update({ status: "failed", finished_at: new Date().toISOString(), accounts_checked: checked, recommendations_created: recommendations, error: error?.message || "failed", payload: { detail, skippedNoTier, settings } }).eq("id", run.id);
     throw error;
   }
 }
 
-export async function expireStaleSavingsDeals(supabase: any, staleDays: number, triggeredBy?: string | null) {
+export async function expireStaleSavingsDeals(supabase: any, ratesSupabase: any, staleDays: number, triggeredBy?: string | null) {
   const now = new Date().toISOString();
   const threshold = new Date(Date.now() - Math.max(1, staleDays) * 24 * 60 * 60 * 1000).toISOString();
-  const { data: staleRows, error: readError } = await supabase
+  const { data: staleRows, error: readError } = await ratesSupabase
     .from("savings_rate_deals")
     .select("id,status,lifecycle_status,missing_observation_count,gross_aer,source_payload,source_url,verification_status")
     .in("status", ["active", "needs_review"])
@@ -184,7 +224,7 @@ export async function expireStaleSavingsDeals(supabase: any, staleDays: number, 
     const missingCount = Number(deal.missing_observation_count || 0) + 1;
     const shouldWithdraw = missingCount >= 3;
     const lifecycleStatus = shouldWithdraw ? "WITHDRAWN" : "PENDING_WITHDRAWAL";
-    const { error } = await supabase.from("savings_rate_deals").update({
+    const { error } = await ratesSupabase.from("savings_rate_deals").update({
       status: shouldWithdraw ? "expired" : deal.status,
       lifecycle_status: lifecycleStatus,
       missing_observation_count: missingCount,
@@ -193,7 +233,10 @@ export async function expireStaleSavingsDeals(supabase: any, staleDays: number, 
       admin_notes: `${shouldWithdraw ? "Withdrawn" : "Pending withdrawal"} after ${missingCount} missing/stale observation(s). Last-check threshold ${threshold}. Triggered by ${triggeredBy || "system"}.`,
     }).eq("id", deal.id);
     if (error) throw new Error(error.message);
-    await supabase.from("savings_rate_deal_versions").insert({
+    // Deal history belongs beside the catalogue. Since the catalogue moved to
+    // the rates project, writing this through the main client would either
+    // version a stale local row or fail for a newly-created external deal ID.
+    await ratesSupabase.from("savings_rate_deal_versions").insert({
       savings_rate_deal_id: deal.id,
       lifecycle_status: lifecycleStatus,
       verification_status: deal.verification_status || "UNVERIFIED",

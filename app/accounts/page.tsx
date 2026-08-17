@@ -6,7 +6,10 @@ import { StatCard } from "@/components/StatCard";
 import { FormInput } from "@/components/FormInput";
 import { SubmitButton } from "@/components/SubmitButton";
 import { BalanceHistoryChart } from "@/components/BalanceHistoryChart";
+import { SavingsMovementChart, type SavingsMovementPoint } from "@/components/savings/SavingsMovementChart";
 import { createClient } from "@/lib/supabase/server";
+import { createWorkerDatabaseClient } from "@/platform/database/worker-client";
+import { getCachedSavingsRateDeals } from "@/lib/wealth/cached-savings-rate-deals";
 import {
   dedupeHouseholdPeople,
   getActiveHouseholdContext,
@@ -36,11 +39,19 @@ import { PageLandingExperience } from "@/components/landing/PageLandingExperienc
 import { calculateSavingsAccruedBalance } from "@/lib/wealth/savings-accrual";
 import {
   buildSavingsTrajectory,
+  estimatedSavingsBalanceFromLedger,
   movementDelta,
   movementDirection,
   savingsMonthSummary,
 } from "@/lib/wealth/savings-ledger";
 import { estimateSavingsInterestForMonth } from "@/lib/wealth/savings-interest";
+import {
+  classifyIsaWrapper,
+  isaAllowanceLimitForPerson,
+  isaAllowanceRule,
+  isaPersonEligibility,
+  isJuniorIsaWrapper,
+} from "@/lib/wealth/isa-allowance";
 import {
   deriveIncomePensionContribution,
   deriveMonthlyPensionContribution,
@@ -55,6 +66,8 @@ import {
   providerSlugsFromAccounts,
   savingsDealEligibleBalance,
   savingsDealMatchesAccount,
+  isChildSavingsDeal,
+  type SavingsDealLike,
 } from "@/lib/wealth/savings-intelligence";
 import {
   addFinancialAccount,
@@ -108,6 +121,17 @@ type FinancialAccount = {
   savings_goal_monthly_contribution_override?: number | null;
   savings_goal_priority?: number | null;
   savings_goal_status?: string | null;
+  owner_is_child?: boolean;
+  owner_relationship?: string | null;
+  owner_birth_date?: string | null;
+};
+
+type InvestmentIsaAccount = {
+  id: string;
+  person_id?: string | null;
+  account_type?: string | null;
+  provider_isa_subscribed_amount?: number | null;
+  provider_isa_allowance_year?: string | null;
 };
 
 type SavingsOwner = {
@@ -161,9 +185,15 @@ type HeldProvider = {
   relationship_type: string | null;
 };
 
+type DealFeedback = {
+  eligibility_status?: string | null;
+  used_before?: boolean | null;
+};
+
 type SavingsRateRecommendation = {
   id: string;
   financial_account_id: string | null;
+  savings_rate_deal_id: string | null;
   provider_slug: string | null;
   provider_name: string | null;
   product_name: string | null;
@@ -192,9 +222,11 @@ type SavingsMovement = {
   note: string | null;
   created_at: string | null;
   source_type?: string | null;
+  tax_year?: string | null;
 };
 
 type PlannedItem = {
+  label?: string | null;
   direction: string | null;
   amount: number | null;
   monthly_cost?: number | null;
@@ -202,6 +234,17 @@ type PlannedItem = {
   start_date: string | null;
   end_date: string | null;
   end_behavior?: string | null;
+  spending_categories?: {
+    standard_category_key: string | null;
+    emergency_fund_essential?: boolean | null;
+    spending_category_groups?: { emergency_fund_essential?: boolean | null } | Array<{ emergency_fund_essential?: boolean | null }> | null;
+  } | null;
+};
+
+type ChildEssentialCost = {
+  label?: string | null;
+  monthly_cost?: number | null;
+  spending_categories?: PlannedItem["spending_categories"];
 };
 
 type PayEvent = {
@@ -387,6 +430,29 @@ function movementLabel(type: string) {
   return clean.charAt(0).toUpperCase() + clean.slice(1);
 }
 
+function buildSavingsMovementSeries(movements: SavingsMovement[], months = 12): SavingsMovementPoint[] {
+  const now = new Date();
+  const rows: SavingsMovementPoint[] = [];
+  const byMonth = new Map<string, SavingsMovementPoint>();
+  for (let offset = months - 1; offset >= 0; offset -= 1) {
+    const date = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+    const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+    const row = { month, saved: 0, interest: 0, withdrawn: 0 };
+    rows.push(row);
+    byMonth.set(month, row);
+  }
+  for (const movement of movements) {
+    const month = String(movement.effective_at || movement.created_at || "").slice(0, 7);
+    const row = byMonth.get(month);
+    if (!row || movement.movement_type === "opening_balance") continue;
+    const amount = Math.abs(movementDelta(movement));
+    if (movement.movement_type === "interest") row.interest += amount;
+    else if (["withdrawal", "fee"].includes(movement.movement_type) || movementDirection(movement) === "out") row.withdrawn += amount;
+    else row.saved += amount;
+  }
+  return rows;
+}
+
 function cleanDealLabel(value?: string | null) {
   return String(value || "Not stated").replaceAll("_", " ");
 }
@@ -398,7 +464,7 @@ function daysOld(value?: string | null) {
   return Math.max(0, Math.floor((Date.now() - timestamp) / 86_400_000));
 }
 
-function dealInfoRows(deal: any) {
+function dealInfoRows(deal: SavingsDealLike) {
   return [
     { label: "Rate type", value: cleanDealLabel(deal.rate_type) },
     { label: "Access", value: cleanDealLabel(deal.access_type || deal.account_type) },
@@ -443,6 +509,92 @@ function maximumDealReturn(deal: {
   return null;
 }
 
+function dealMaximumDeposit(deal: SavingsDealLike) {
+  const maximum = Number(deal.maximum_balance || 0);
+  const minimum = Number(deal.minimum_balance || 0);
+  // Tiny extracted maxima (for example £2 beside a £1 minimum) are commonly
+  // page-navigation artefacts, not genuine product limits. Do not headline them.
+  if (maximum > 0 && !(maximum < 100 && maximum <= Math.max(2, minimum * 2))) return maximum;
+  const monthly = Number(deal.monthly_max_deposit || 0);
+  const months = Number(deal.term_length_months || 12);
+  return monthly > 0 ? monthly * Math.max(1, months) : null;
+}
+
+function dealAccessLabel(deal: SavingsDealLike) {
+  if (deal.notice_period_days) return `${deal.notice_period_days} days' notice`;
+  if (deal.term_length_months) return `${deal.term_length_months}-month term`;
+  return cleanDealLabel(deal.access_type || deal.rate_type || "Check access");
+}
+
+function SavingsDealCard({
+  deal,
+  personLabel,
+  feedback,
+}: {
+  deal: SavingsDealLike & { eligible_now?: boolean; best_gain?: number };
+  personLabel: string;
+  feedback?: { eligibility_status?: string | null; used_before?: boolean | null } | null;
+}) {
+  const maximumDeposit = dealMaximumDeposit(deal);
+  const returnModel = maximumDealReturn(deal);
+  const childOnly = isChildSavingsDeal(deal);
+  const tone = childOnly ? "border-violet-200 bg-violet-50/60" : deal.eligible_now ? "border-emerald-200 bg-emerald-50/60" : "border-orange-200 bg-orange-50/50";
+  const personTone = childOnly ? "bg-violet-700" : deal.eligible_now ? "bg-emerald-700" : "bg-orange-600";
+  return (
+    <article className={`relative rounded-[1.75rem] border p-5 pt-7 shadow-sm ${tone}`}>
+      <span className={`absolute -top-3 left-5 rounded-full px-3 py-1.5 text-[11px] font-black uppercase tracking-wide text-white shadow-sm ${personTone}`}>{personLabel}</span>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-xs font-black uppercase tracking-[0.14em] text-slate-500">{deal.provider_name ?? deal.provider_slug ?? "Provider"}</p>
+          <h4 className="mt-1 text-lg font-black leading-tight text-slate-950">{deal.product_name ?? "Savings account"}</h4>
+          <p className="mt-1 text-sm font-bold text-slate-500">{cleanDealLabel(deal.account_type || deal.access_type || "Savings account")}</p>
+        </div>
+        <div className="shrink-0 text-right"><p className="text-3xl font-black text-slate-950">{deal.gross_aer != null ? `${Number(deal.gross_aer).toFixed(2)}%` : "TBC"}</p><p className="text-[10px] font-black uppercase tracking-wide text-slate-400">AER</p></div>
+      </div>
+      <div className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className="rounded-2xl bg-white/90 p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-400">Save overall</p><p className="mt-1 text-sm font-black text-slate-950">{maximumDeposit ? `Up to ${formatMoney(maximumDeposit)}` : "No maximum stated"}</p></div>
+        <div className="rounded-2xl bg-white/90 p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-400">Pay in monthly</p><p className="mt-1 text-sm font-black text-slate-950">{deal.monthly_max_deposit != null ? `Up to ${formatMoney(deal.monthly_max_deposit)}` : "No monthly cap stated"}</p></div>
+        <div className="col-span-2 rounded-2xl bg-white/90 p-3 sm:col-span-1"><p className="text-[10px] font-black uppercase tracking-wide text-slate-400">Access</p><p className="mt-1 text-sm font-black text-slate-950">{dealAccessLabel(deal)}</p></div>
+      </div>
+      {returnModel ? <p className="mt-3 text-sm font-bold text-slate-600">Could earn about <span className="font-black text-slate-950">{formatMoney(returnModel.interest)}</span> at the maximum modelled deposit.</p> : null}
+      <details className="mt-4 border-t border-slate-200/80 pt-3">
+        <summary className="ml-auto w-fit cursor-pointer list-none rounded-full bg-slate-950 px-4 py-2 text-xs font-black text-white">Explore further →</summary>
+        <div className="mt-4 rounded-2xl bg-white/80 p-4">
+          <div className="grid grid-cols-2 gap-x-5 gap-y-3 text-sm sm:grid-cols-4">{dealInfoRows(deal).map((row) => <div key={row.label}><p className="text-[10px] font-black uppercase tracking-wide text-slate-400">{row.label}</p><p className="mt-1 font-bold text-slate-700">{row.value}</p></div>)}</div>
+          {deal.requires_existing_customer ? <p className="mt-4 text-xs font-bold text-orange-700">Requires an existing relationship with {deal.eligible_provider_slug || deal.provider_name || deal.provider_slug}.</p> : null}
+          {deal.withdrawal_rules ? <p className="mt-3 text-xs font-bold leading-5 text-slate-600">{deal.withdrawal_rules}</p> : null}
+          <form action={saveSavingsDealEligibility} className="mt-4 flex flex-wrap items-center gap-2">
+            <input type="hidden" name="savings_rate_deal_id" value={deal.id} />
+            <span className="text-xs font-black text-slate-700">Applicable?</span>
+            <button name="eligibility_status" value="eligible" className={`rounded-full px-3 py-1.5 text-xs font-black ${feedback?.eligibility_status === "eligible" ? "bg-emerald-800 text-white" : "bg-emerald-50 text-emerald-800"}`}>Yes</button>
+            <button name="eligibility_status" value="not_eligible" className={`rounded-full px-3 py-1.5 text-xs font-black ${feedback?.eligibility_status === "not_eligible" ? "bg-rose-600 text-white" : "bg-rose-50 text-rose-700"}`}>No</button>
+            <label className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5 text-xs font-black text-blue-700"><input type="checkbox" name="used_before" value="true" defaultChecked={Boolean(feedback?.used_before)} className="h-4 w-4 accent-blue-700" /> Used before</label>
+          </form>
+          {deal.source_url ? <a href={deal.source_url} target="_blank" rel="noreferrer" className="mt-4 inline-block text-xs font-black text-slate-800 underline">View provider/source details ↗</a> : null}
+        </div>
+      </details>
+    </article>
+  );
+}
+
+function SavingsRecommendationCard({ recommendation, account, deal, personLabel }: { recommendation: SavingsRateRecommendation; account?: FinancialAccount | null; deal?: SavingsDealLike | null; personLabel: string }) {
+  return (
+    <article className="relative rounded-[1.75rem] border border-orange-200 bg-gradient-to-br from-orange-50 to-white p-5 pt-7 shadow-sm">
+      <span className="absolute -top-3 left-5 rounded-full bg-slate-950 px-3 py-1.5 text-[11px] font-black uppercase tracking-wide text-white shadow-sm">{personLabel}</span>
+      <p className="text-xs font-black uppercase tracking-[0.14em] text-orange-700">{recommendation.provider_name || recommendation.provider_slug || "Provider"}</p>
+      <h3 className="mt-1 text-xl font-black text-slate-950">{recommendation.product_name || "Better-rate account"}</h3>
+      <p className="mt-1 text-sm font-bold text-slate-500">{deal ? cleanDealLabel(deal.account_type || deal.access_type) : "Savings account"}</p>
+      <div className="mt-5 grid grid-cols-3 gap-2">
+        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Now</p><p className="font-black text-slate-950">{Number(recommendation.current_rate || 0).toFixed(2)}%</p></div>
+        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Better rate</p><p className="font-black text-slate-950">{Number(recommendation.suggested_rate || 0).toFixed(2)}%</p></div>
+        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Could add</p><p className="font-black text-slate-950">{formatMoney(recommendation.estimated_annual_gain)}/yr</p></div>
+      </div>
+      {deal ? <div className="mt-3 grid grid-cols-2 gap-2"><div className="rounded-2xl bg-white/90 p-3"><p className="text-[10px] font-black uppercase text-slate-400">Save overall</p><p className="text-sm font-black">{dealMaximumDeposit(deal) ? `Up to ${formatMoney(dealMaximumDeposit(deal))}` : "No maximum stated"}</p></div><div className="rounded-2xl bg-white/90 p-3"><p className="text-[10px] font-black uppercase text-slate-400">Pay in monthly</p><p className="text-sm font-black">{deal.monthly_max_deposit ? `Up to ${formatMoney(deal.monthly_max_deposit)}` : "No cap stated"}</p></div></div> : null}
+      <details className="mt-4 border-t border-orange-200 pt-3"><summary className="ml-auto w-fit cursor-pointer list-none rounded-full bg-slate-950 px-4 py-2 text-xs font-black text-white">Explore further →</summary><div className="mt-4 rounded-2xl bg-white p-4"><p className="text-sm font-bold leading-6 text-slate-600">{recommendation.reason || "Check the eligibility, access and deposit rules before moving money."}</p>{account ? <p className="mt-3 text-xs font-bold text-slate-500">Compared with {account.provider || "your provider"} · {account.name || "tracked account"}</p> : null}{recommendation.source_url ? <a href={recommendation.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-block text-xs font-black text-orange-700 underline">View provider/source details ↗</a> : null}</div></details>
+    </article>
+  );
+}
+
 function TabLink({ tab, activeTab }: { tab: SavingsTab; activeTab: SavingsTab }) {
   const config = tabs.find((item) => item.key === tab)!;
   return (
@@ -479,6 +631,10 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
   const activeTab = tabs.some((tab) => tab.key === resolvedSearchParams.tab) ? (resolvedSearchParams.tab as SavingsTab) : "overview";
 
   const supabase = await createClient();
+  const ratesSupabase = createWorkerDatabaseClient("rates");
+  // The rates catalogue (savings_rate_deals below) now lives in its own,
+  // separate Supabase project — moved off the main database due to usage
+  // overage. Everything else on this page still uses the regular client.
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -505,6 +661,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     { data: householdMeta },
     { data: movements },
     { data: plannedItems },
+    { data: childEssentialCosts },
     { data: payEventsInitial },
     { data: pensionAccounts },
     { data: pensionFunds },
@@ -513,6 +670,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     { data: savingsPots },
     { data: savingsPotAllocations },
     { data: dealEligibilityRows },
+    { data: investmentIsaAccounts },
   ] = await Promise.all([
     supabase
       .from("financial_accounts")
@@ -523,25 +681,17 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       .eq("is_liability", false)
       .order("created_at", { ascending: false })
       .returns<FinancialAccount[]>(),
-    supabase
-      .from("savings_rate_deals")
-      .select(
-        "id, provider_slug, provider_name, product_name, account_type, gross_aer, bonus_rate, minimum_balance, maximum_balance, monthly_min_deposit, monthly_max_deposit, access_type, withdrawal_rules, notice_period_days, term_length_months, rate_type, requires_existing_customer, eligible_provider_slug, eligibility_note, source_url, status, last_checked_at",
-      )
-      .eq("status", "active")
-      .order("gross_aer", { ascending: false })
-      .limit(100)
-      .returns<SavingsDeal[]>(),
+    getCachedSavingsRateDeals().then((data) => ({ data: data as SavingsDeal[] })),
     supabase
       .from("user_financial_provider_relationships")
       .select("provider_slug, provider_name, relationship_type")
       .eq("user_id", user.id)
       .eq("is_active", true)
       .returns<HeldProvider[]>(),
-    supabase
+    ratesSupabase
       .from("savings_rate_recommendations")
       .select(
-        "id, financial_account_id, provider_slug, provider_name, product_name, recommendation_kind, eligibility_status, current_rate, suggested_rate, rate_delta, balance_checked, estimated_annual_gain, source_url, reason, status, created_at",
+        "id, financial_account_id, savings_rate_deal_id, provider_slug, provider_name, product_name, recommendation_kind, eligibility_status, current_rate, suggested_rate, rate_delta, balance_checked, estimated_annual_gain, source_url, reason, status, created_at",
       )
       .eq("user_id", user.id)
       .in("status", ["new", "seen", "watching"])
@@ -568,16 +718,21 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       : Promise.resolve({ data: null }),
     supabase
       .from("savings_account_movements")
-      .select("id, financial_account_id, movement_type, amount, previous_balance, balance_delta, resulting_balance, effective_at, note, created_at, source_type")
+      .select("id, financial_account_id, movement_type, amount, previous_balance, balance_delta, resulting_balance, effective_at, note, created_at, source_type, tax_year")
       .or(householdVisibleFilter)
       .order("effective_at", { ascending: false })
       .limit(1000)
       .returns<SavingsMovement[]>(),
     supabase
       .from("planned_items")
-      .select("direction, amount, monthly_cost, recurrence, start_date, end_date, end_behavior")
+      .select("label, direction, amount, recurrence, start_date, end_date, end_behavior, spending_categories(standard_category_key, emergency_fund_essential, spending_category_groups(emergency_fund_essential))")
       .or(householdMemberFilter)
       .returns<PlannedItem[]>(),
+    supabase
+      .from("child_costs")
+      .select("label, monthly_cost, spending_categories(standard_category_key, emergency_fund_essential, spending_category_groups(emergency_fund_essential))")
+      .or(householdMemberFilter)
+      .returns<ChildEssentialCost[]>(),
     supabase
       .from("pay_events")
       .select("id, person_id, label, pay_kind, gross_annual_salary, monthly_take_home_override, pension_percent, pension_method, employer_pension_percent, employer_pension_monthly_amount, employer_ni_topup_enabled, employer_ni_rate_percent, employer_ni_topup_share_percent, effective_from, effective_until")
@@ -593,20 +748,20 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       .select("id, pension_account_id, fund_name, current_value, units, unit_price")
       .in("user_id", memberUserIds)
       .returns<PensionFund[]>(),
-    supabase
+    activeTab === "projection" ? supabase
       .from("pension_fund_value_snapshots")
       .select("pension_account_id, snapshot_date, value, monthly_contribution_applied, unit_price")
       .in("user_id", memberUserIds)
       .gte("snapshot_date", pensionHistoryStartDate)
       .order("snapshot_date", { ascending: true })
-      .returns<PensionSnapshot[]>(),
-    supabase
+      .returns<PensionSnapshot[]>() : Promise.resolve({ data: [] as PensionSnapshot[] }),
+    activeTab === "projection" ? supabase
       .from("pension_contribution_events")
       .select("pension_account_id, contribution_date, contribution_due_date, investment_date, contribution_amount, employee_amount, employer_amount, employer_ni_topup_amount, fixed_amount, event_status")
       .in("user_id", memberUserIds)
       .gte("contribution_date", pensionHistoryStartDate)
       .order("contribution_date", { ascending: true })
-      .returns<PensionContributionEvent[]>(),
+      .returns<PensionContributionEvent[]>() : Promise.resolve({ data: [] as PensionContributionEvent[] }),
     supabase
       .from("savings_pots")
       .select("id,user_id,household_id,person_id,name,target_amount,target_date,monthly_target,current_allocated_amount,priority,priority_is_important,priority_score,goal_type,colour,icon,status,visibility_scope,notes,reference_image_url")
@@ -624,6 +779,12 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       .from("user_savings_deal_eligibility")
       .select("savings_rate_deal_id, eligibility_status, used_before")
       .eq("user_id", user.id),
+    supabase
+      .from("investment_accounts")
+      .select("id,person_id,account_type,provider_isa_subscribed_amount,provider_isa_allowance_year")
+      .in("user_id", memberUserIds)
+      .neq("record_status", "archived")
+      .returns<InvestmentIsaAccount[]>(),
   ]);
 
   let payEvents = payEventsInitial ?? [];
@@ -663,35 +824,107 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     null;
   const ownerById = new Map(ownerOptions.map((person) => [person.id, person]));
 
-  const accountRows = (accounts ?? []).filter((account) => !["current_account"].includes(account.account_type));
+  const childPersonIds = new Set(ownerOptions.filter((person) => String(person.relationship || "").toLowerCase() === "child").map((person) => person.id));
+  const accountRows: FinancialAccount[] = (accounts ?? [])
+    .filter((account) => !["current_account"].includes(account.account_type))
+    .map((account) => {
+      const owner = ownerById.get(String(account.owner_person_id || ""));
+      return {
+        ...account,
+        owner_is_child: childPersonIds.has(String(account.owner_person_id || "")),
+        owner_relationship: owner?.relationship || null,
+        owner_birth_date: owner?.birth_date || null,
+      } as FinancialAccount;
+    });
   // Everyday / current accounts aren't savings vehicles (no rate, no goal), but they still need to exist
   // as financial_accounts rows so they can be picked as a "paid into" / "paid from" account elsewhere
   // in Financial Flow (spending, income, planner). Surface them here so people can add/manage them.
   const everydayAccountRows = (accounts ?? []).filter((account) => account.account_type === "current_account");
   const personalSavings = accountRows.filter((account) => account.owner_person_id || account.ownership_scope === "personal" || account.ownership_scope === "child");
   const sharedSavings = accountRows.filter((account) => !account.owner_person_id || ["household", "joint"].includes(String(account.ownership_scope || "")));
-  const totalSavings = accountRows.reduce((sum, account) => sum + calculateSavingsAccruedBalance(account).estimatedBalance, 0);
+  const totalSavings = accountRows.reduce((sum, account) => sum + estimatedSavingsBalanceFromLedger(account, movements ?? []), 0);
   const monthlyTopUps = accountRows.reduce((sum, account) => sum + Number(account.monthly_top_up_amount || 0), 0);
   const weightedRate = totalSavings > 0
-    ? accountRows.reduce((sum, account) => sum + calculateSavingsAccruedBalance(account).estimatedBalance * Number(account.interest_rate || 0), 0) / totalSavings
+    ? accountRows.reduce((sum, account) => sum + estimatedSavingsBalanceFromLedger(account, movements ?? []) * Number(account.interest_rate || 0), 0) / totalSavings
     : 0;
 
   const allHeldProviders = providerSlugsFromAccounts(accountRows, heldProviders ?? []);
   const dealMatches = classifySavingsDeals(accountRows, savingsDeals ?? [], allHeldProviders);
-  const eligibleDeals = dealMatches.filter((deal) => deal.eligible_now);
-  const needsProviderDeals = dealMatches.filter((deal) => !deal.eligible_now);
-  const eligibilityByDeal = new Map((dealEligibilityRows ?? []).map((row: any) => [row.savings_rate_deal_id, row]));
+  const adultEligibleDeals = dealMatches.filter((deal) => deal.eligible_now && !isChildSavingsDeal(deal));
+  const adultNeedsProviderDeals = dealMatches.filter((deal) => !deal.eligible_now && !isChildSavingsDeal(deal));
+  const childDeals = dealMatches.filter((deal) => isChildSavingsDeal(deal));
+  const eligibilityByDeal = new Map<string, DealFeedback>((dealEligibilityRows ?? []).map((row) => [String(row.savings_rate_deal_id), row as DealFeedback]));
   const adultPersonIds = ownerOptions
     .filter((person) => String(person.relationship || "").toLowerCase() !== "child")
     .map((person) => person.id);
+  const activeIsaRule = isaAllowanceRule();
+  const isaAccountById = new Map(accountRows.map((account) => [
+    account.id,
+    classifyIsaWrapper(account.savings_product_name, account.name, account.savings_limit_scope, account.account_type),
+  ]));
+  const isaPositions = ownerOptions.map((person) => {
+    const isDefault = person.id === defaultOwnerPerson?.id;
+    const savingsSubscriptions = (movements ?? []).reduce((sum, movement) => {
+      const account = accountRows.find((row) => row.id === movement.financial_account_id);
+      if (!account) return sum;
+      const wrapper = isaAccountById.get(account.id) || "not_isa";
+      if (wrapper === "not_isa" || String(movement.movement_type).toLowerCase() !== "deposit") return sum;
+      if (movement.tax_year !== activeIsaRule.taxYear) return sum;
+      const belongsToPerson = account.owner_person_id === person.id || (isDefault && !account.owner_person_id);
+      return belongsToPerson ? sum + Math.max(0, movementDelta(movement)) : sum;
+    }, 0);
+    const providerSubscriptions = (investmentIsaAccounts ?? []).reduce((sum, account) => {
+      const wrapper = classifyIsaWrapper(account.account_type);
+      if (wrapper === "not_isa" || account.provider_isa_allowance_year !== activeIsaRule.taxYear) return sum;
+      const belongsToPerson = account.person_id === person.id || (isDefault && !account.person_id);
+      return belongsToPerson ? sum + Math.max(0, Number(account.provider_isa_subscribed_amount || 0)) : sum;
+    }, 0);
+    const representativeWrapper = String(person.relationship || "").toLowerCase() === "child" ? "junior_cash_isa" as const : "cash_isa" as const;
+    const eligibility = isaPersonEligibility(person, representativeWrapper);
+    const allowance = isaAllowanceLimitForPerson(person, representativeWrapper, activeIsaRule.taxYear);
+    const used = savingsSubscriptions + providerSubscriptions;
+    return {
+      person,
+      wrapper: representativeWrapper,
+      eligibility,
+      allowance,
+      used,
+      remaining: Math.max(0, allowance - used),
+      savingsSubscriptions,
+      providerSubscriptions,
+    };
+  });
+  const subjectIsaPosition = isaPositions.find((position) => position.person.id === (defaultOwnerPerson?.id || adultPersonIds[0]));
+  const emergencyItems: PlannedItem[] = [
+    ...(plannedItems ?? []),
+    ...(childEssentialCosts ?? []).map((cost) => ({
+      label: cost.label,
+      direction: "outgoing",
+      amount: Number(cost.monthly_cost || 0),
+      recurrence: "monthly",
+      start_date: null,
+      end_date: null,
+      spending_categories: cost.spending_categories,
+    })),
+  ];
   const intelligence = buildSavingsIntelligence({
     accounts: accountRows,
     deals: savingsDeals ?? [],
     relationships: allHeldProviders,
-    plannedItems: plannedItems ?? [],
+    plannedItems: emergencyItems.map((item) => {
+      const groupRelation = item.spending_categories?.spending_category_groups;
+      const groupEssential = Array.isArray(groupRelation) ? groupRelation.some((group) => group.emergency_fund_essential) : Boolean(groupRelation?.emergency_fund_essential);
+      return {
+        ...item,
+        standard_category_key: item.spending_categories?.standard_category_key ?? null,
+        emergency_fund_essential: Boolean(item.spending_categories?.emergency_fund_essential || groupEssential),
+      };
+    }),
     payEvents: payEvents ?? [],
     subjectPersonId: defaultOwnerPerson?.id || adultPersonIds[0] || null,
     adultPersonIds,
+    subjectIsaSubscribedAmount: subjectIsaPosition?.used || 0,
+    subjectIsaAllowance: subjectIsaPosition?.allowance || activeIsaRule.adultTotalLimit,
   });
 
   const movementsByAccount = new Map<string, SavingsMovement[]>();
@@ -707,6 +940,12 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
   const currentMonthKey = intelligence.today.slice(0, 7);
   const currentMonthSummary = savingsMonthSummary(movements ?? [], currentMonthKey);
   const currentMonthInterest = estimateSavingsInterestForMonth(accountRows, movements ?? [], currentMonthKey);
+  const savingsMovementSeries = buildSavingsMovementSeries(movements ?? [], 12);
+  const essentialItemCount = emergencyItems.filter((item) => {
+    const groupRelation = item.spending_categories?.spending_category_groups;
+    const groupEssential = Array.isArray(groupRelation) ? groupRelation.some((group) => group.emergency_fund_essential) : Boolean(groupRelation?.emergency_fund_essential);
+    return item.direction !== "income" && Boolean(item.spending_categories?.emergency_fund_essential || groupEssential);
+  }).length;
 
   const pensionFundValueByAccount = new Map<string, number>();
   let unassignedPensionFundValue = 0;
@@ -752,7 +991,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
   const projectionAccounts = accountRows.map((account) => ({
     id: account.id,
     name: account.name || account.savings_product_name || account.provider || "Savings account",
-    balance: calculateSavingsAccruedBalance(account).estimatedBalance,
+    balance: estimatedSavingsBalanceFromLedger(account, movements ?? []),
     annualRate: Number(account.interest_rate || 0),
     monthlyTopUp: Number(account.monthly_top_up_amount || 0),
   }));
@@ -811,7 +1050,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
         savingsAccounts: personSavings.map((account) => ({
           id: account.id,
           name: account.name || account.savings_product_name || account.provider || "Savings account",
-          balance: calculateSavingsAccruedBalance(account).estimatedBalance,
+          balance: estimatedSavingsBalanceFromLedger(account, movements ?? []),
           annualRate: Number(account.interest_rate || 0),
           monthlyTopUp: Number(account.monthly_top_up_amount || 0),
         })),
@@ -831,6 +1070,27 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     .sort((a, b) => Number(a.account.savings_goal_priority || 99) - Number(b.account.savings_goal_priority || 99));
 
   const accountById = new Map(accountRows.map((account) => [account.id, account]));
+  const dealById = new Map((savingsDeals ?? []).map((deal) => [deal.id, deal]));
+  const visibleSavingsRecommendations = (savingsRecommendations ?? []).filter((recommendation) => {
+    const account = recommendation.financial_account_id ? accountById.get(recommendation.financial_account_id) : null;
+    const deal = recommendation.savings_rate_deal_id ? dealById.get(recommendation.savings_rate_deal_id) : null;
+    return !account || !deal || savingsDealMatchesAccount(account, deal);
+  });
+  const adultRecommendations = visibleSavingsRecommendations.filter((recommendation) => {
+    const deal = recommendation.savings_rate_deal_id ? dealById.get(recommendation.savings_rate_deal_id) : null;
+    return !deal || !isChildSavingsDeal(deal);
+  });
+  const childRecommendations = visibleSavingsRecommendations.filter((recommendation) => {
+    const deal = recommendation.savings_rate_deal_id ? dealById.get(recommendation.savings_rate_deal_id) : null;
+    return Boolean(deal && isChildSavingsDeal(deal));
+  });
+  const personLabelForAccount = (account?: FinancialAccount | null) => {
+    if (account?.owner_person_id) return ownerById.get(account.owner_person_id)?.name || (account.owner_is_child ? "Child" : "Account owner");
+    return account?.owner_is_child ? "Child" : defaultOwnerPerson?.name || "You";
+  };
+  const childAudienceLabel = ownerOptions.filter((person) => String(person.relationship || "").toLowerCase() === "child").length === 1
+    ? ownerOptions.find((person) => String(person.relationship || "").toLowerCase() === "child")?.name || "Child"
+    : "Children";
   const allocationsByPot = new Map<string, SavingsPotAllocation[]>();
   for (const allocation of savingsPotAllocations ?? []) {
     const rows = allocationsByPot.get(allocation.savings_pot_id) || [];
@@ -850,7 +1110,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       ? allocations.reduce((sum, allocation) => {
           const account = allocation.financial_account_id ? accountById.get(allocation.financial_account_id) : null;
           const percent = Number(allocation.allocation_percent || 0);
-          if (account && percent > 0) return sum + calculateSavingsAccruedBalance(account).estimatedBalance * Math.min(100, percent) / 100;
+          if (account && percent > 0) return sum + estimatedSavingsBalanceFromLedger(account, movements ?? []) * Math.min(100, percent) / 100;
           return sum + Math.max(0, Number(allocation.amount || 0));
         }, 0)
       : Math.max(0, Number(pot.current_allocated_amount || 0));
@@ -899,6 +1159,8 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     const priorityLabel = priorityValue <= 25 ? "High" : priorityValue <= 65 ? "Medium" : "Low";
     const firstLinked = allocations.find((allocation) => allocation.financial_account_id)?.financial_account_id;
     const linkedAccount = firstLinked ? accountById.get(firstLinked) : null;
+    const attentionStatus: "attention" | "on_track" | "complete" =
+      progress >= 100 || onTrackScore >= 90 ? "complete" : onTrackScore < 50 ? "attention" : "on_track";
     return {
       pot,
       allocations,
@@ -917,11 +1179,28 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
       priorityLabel,
       linkedAccount,
       owner: pot.person_id ? ownerById.get(pot.person_id) : null,
+      attentionStatus,
     };
   });
 
+  // BUGFIX/FEATURE ("do we have logic that changes the way people see
+  // pots — so it's not basic"): the data to do this properly already
+  // existed (onTrackScore, progress) but was only ever used as a passive
+  // badge colour — the list itself was flat, sorted by a manually-set
+  // priority number regardless of which pots actually needed attention
+  // right now. This groups pots that are genuinely behind pace to the
+  // top, so the ones that need a decision are the first thing seen, not
+  // buried in the same flat grid as ones already doing fine.
+  const attentionOrder = { attention: 0, on_track: 1, complete: 2 } as const;
+  const sortedPotRows = [...potRows].sort((a, b) => {
+    const statusDiff = attentionOrder[a.attentionStatus] - attentionOrder[b.attentionStatus];
+    if (statusDiff !== 0) return statusDiff;
+    return a.onTrackScore - b.onTrackScore; // most urgent (lowest score) first within a group
+  });
+  const attentionPotCount = potRows.filter((row) => row.attentionStatus === "attention").length;
+
   const optimiserRows = accountRows.map((account) => {
-    const balance = calculateSavingsAccruedBalance(account).estimatedBalance;
+    const balance = estimatedSavingsBalanceFromLedger(account, movementsByAccount.get(account.id) || []);
     const currentRate = Number(account.interest_rate || 0);
     const best = dealMatches
       .filter((deal) => deal.eligible_now && savingsDealMatchesAccount(account, deal))
@@ -954,7 +1233,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
     };
   });
   const totalOpportunityCost = optimiserRows.reduce((sum, row) => sum + row.annualGain, 0);
-  const latestRecommendationAt = (savingsRecommendations ?? [])
+  const latestRecommendationAt = visibleSavingsRecommendations
     .map((row) => row.created_at)
     .filter((value): value is string => Boolean(value))
     .sort()
@@ -1072,7 +1351,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
                     <input type="hidden" name="ownership_scope" value={account.ownership_scope || (account.owner_person_id ? "personal" : "household")} />
                     <input type="hidden" name="visibility_scope" value={account.visibility_scope || "household"} />
                     <input type="hidden" name="savings_limit_scope" value={account.savings_limit_scope || "individual"} />
-                    <FormInput label="Confirmed balance" name="current_balance" type="number" step="0.01" defaultValue={calculateSavingsAccruedBalance(account).estimatedBalance} />
+                    <FormInput label="Confirmed balance" name="current_balance" type="number" step="0.01" defaultValue={account.balance_last_confirmed_value ?? account.current_balance} />
                     <FormInput label="Rate %" name="interest_rate" type="number" step="0.001" defaultValue={account.interest_rate ?? ""} />
                     <label className="text-sm font-bold text-slate-700">
                       Interest accrues
@@ -1117,7 +1396,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
             <dl className="grid grid-cols-2 gap-3 px-5 pb-4">
               <div className="rounded-2xl bg-slate-50 p-3">
                 <dt className="text-xs font-bold text-slate-500">Est. balance</dt>
-                <dd><SavingsLiveBalance account={account} /></dd>
+                <dd><SavingsLiveBalance account={account} ledgerBalance={estimatedSavingsBalanceFromLedger(account, movementsByAccount.get(account.id) || [])} /></dd>
               </div>
               <div className="rounded-2xl bg-slate-50 p-3">
                 <dt className="text-xs font-bold text-slate-500">Rate</dt>
@@ -1222,18 +1501,33 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
 
         {activeTab === "overview" ? (
           <div className="grid gap-7 xl:grid-cols-[1.15fr_0.85fr]">
-            <SectionCard title="Savings trajectory" description="Recorded movements drive the solid line; scheduled top-ups and current account rates drive the dotted projection.">
+            <SectionCard title="Savings activity" description="A clean monthly view of what you saved, withdrew and earned in interest. Hover for exact values.">
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <div className="grid grid-cols-3 gap-2">
-                  <div className="rounded-2xl bg-emerald-50 px-4 py-3"><p className="text-[10px] font-black uppercase tracking-wide text-emerald-700">In this month</p><p className="mt-1 font-black text-slate-950">{formatMoney(currentMonthSummary.in)}</p></div>
-                  <div className="rounded-2xl bg-orange-50 px-4 py-3"><p className="text-[10px] font-black uppercase tracking-wide text-orange-700">Out this month</p><p className="mt-1 font-black text-slate-950">{formatMoney(currentMonthSummary.out)}</p></div>
+                  <div className="rounded-2xl bg-orange-50 px-4 py-3"><p className="text-[10px] font-black uppercase tracking-wide text-orange-700">Withdrawn</p><p className="mt-1 font-black text-slate-950">{formatMoney(currentMonthSummary.out)}</p></div>
                   <div className="rounded-2xl bg-blue-50 px-4 py-3"><p className="text-[10px] font-black uppercase tracking-wide text-blue-700">Interest</p><p className="mt-1 font-black text-slate-950">{formatMoney(currentMonthInterest.total)}</p><p className="mt-1 text-xs font-black text-blue-700/70">Provider paid {formatMoney(currentMonthInterest.providerConfirmed)} · through yesterday {formatMoney(currentMonthInterest.accruedThroughYesterday)} · today est. {formatMoney(currentMonthInterest.estimated)}</p></div>
+                  <div className="rounded-2xl bg-emerald-50 px-4 py-3"><p className="text-[10px] font-black uppercase tracking-wide text-emerald-700">Saved</p><p className="mt-1 font-black text-slate-950">{formatMoney(currentMonthSummary.in)}</p></div>
                 </div>
                 <Link href="/accounts?tab=projection" className="rounded-full bg-slate-100 px-4 py-2 text-sm font-black text-slate-600">Expand projection</Link>
               </div>
-              <BalanceHistoryChart data={savingsTrajectory} />
+              <SavingsMovementChart data={savingsMovementSeries} />
             </SectionCard>
             <SectionCard title="LoopWatch" description="LoopWatch checks the whole savings portfolio for rate drag, tax exposure, stale balances and unused Financial Flow.">
+              <div className="mb-5 rounded-3xl border border-blue-100 bg-blue-50/70 p-4">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <div><p className="text-xs font-black uppercase tracking-[0.16em] text-blue-700">Central ISA allowance · {activeIsaRule.taxYear}</p><p className="mt-1 text-sm font-bold text-slate-600">Known current-year subscriptions across savings and investment accounts. Existing ISA balances and ISA-to-ISA transfers do not consume this year&apos;s allowance.</p></div>
+                  <a href={activeIsaRule.sourceUrl} target="_blank" rel="noreferrer" className="text-xs font-black text-blue-800 underline">UK rules ↗</a>
+                </div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  {isaPositions.map((position) => (
+                    <article key={position.person.id} className="rounded-2xl bg-white p-4 shadow-sm">
+                      <div className="flex items-start justify-between gap-3"><div><p className="font-black text-slate-950">{position.person.name}</p><p className="text-xs font-bold text-slate-500">{isJuniorIsaWrapper(position.wrapper) ? "Junior ISA" : "Adult ISA"} allowance</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-black ${position.eligibility.eligible ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>{position.eligibility.eligible ? "Eligible" : "Not eligible"}</span></div>
+                      <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-gradient-to-r from-blue-500 to-emerald-400" style={{ width: `${Math.min(100, position.allowance > 0 ? position.used / position.allowance * 100 : 0)}%` }} /></div>
+                      <div className="mt-2 flex justify-between text-xs font-black"><span className="text-slate-500">Known used {formatMoney(position.used)}</span><span className="text-blue-800">{formatMoney(position.remaining)} left</span></div>
+                    </article>
+                  ))}
+                </div>
+              </div>
               <div className="space-y-3">
                 <OpportunityCard
                   title="Opportunity cost"
@@ -1243,7 +1537,7 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
                 />
                 <OpportunityCard
                   title={`${defaultOwnerPerson?.name || "Your"} interest allowance watch`}
-                  body={intelligence.taxableInterest > 0 ? `Your Personal Savings Allowance is ${formatMoney(intelligence.savingsAllowance)}/yr. Estimated non-ISA interest is ${formatMoney(intelligence.nonIsaInterest)}/yr, leaving ${formatMoney(intelligence.taxableInterest)}/yr taxable. At ${intelligence.savingsTaxRate}% that is about ${formatMoney(intelligence.estimatedSavingsTax)}/yr. Review moving roughly ${formatMoney(intelligence.cashToShelter)} into an ISA, subject to access needs and eligibility. Remaining ISA room: ${formatMoney(Math.max(0, intelligence.isaAllowance - intelligence.isaBalance))}.` : `Your Personal Savings Allowance is ${formatMoney(intelligence.savingsAllowance)}/yr. Estimated non-ISA interest is ${formatMoney(intelligence.nonIsaInterest)}/yr, so no taxable excess is currently projected. Remaining ISA room: ${formatMoney(Math.max(0, intelligence.isaAllowance - intelligence.isaBalance))}.`}
+                  body={intelligence.taxableInterest > 0 ? `Your Personal Savings Allowance is ${formatMoney(intelligence.savingsAllowance)}/yr. Estimated non-ISA interest is ${formatMoney(intelligence.nonIsaInterest)}/yr, leaving ${formatMoney(intelligence.taxableInterest)}/yr taxable. At ${intelligence.savingsTaxRate}% that is about ${formatMoney(intelligence.estimatedSavingsTax)}/yr. Review moving roughly ${formatMoney(intelligence.cashToShelter)} into an ISA, subject to access needs and eligibility. Known current-year ISA room: ${formatMoney(Math.max(0, intelligence.isaAllowance - intelligence.isaSubscribedAmount))}.` : `Your Personal Savings Allowance is ${formatMoney(intelligence.savingsAllowance)}/yr. Estimated non-ISA interest is ${formatMoney(intelligence.nonIsaInterest)}/yr, so no taxable excess is currently projected. Known current-year ISA room: ${formatMoney(Math.max(0, intelligence.isaAllowance - intelligence.isaSubscribedAmount))}.`}
                   metric={intelligence.nonIsaInterest > intelligence.savingsAllowance ? "Review now" : "Watching"}
                   tone={intelligence.nonIsaInterest > intelligence.savingsAllowance * 0.75 ? "warning" : "good"}
                 />
@@ -1262,17 +1556,23 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
               action={createSavingsPot}
               people={ownerOptions.map((person) => ({ id: person.id, name: person.name, relationship: person.relationship }))}
               accounts={accountRows.map((account) => ({ id: account.id, name: account.name, provider: account.provider }))}
-              essentialMonthlyOutgoings={Math.max(0, intelligence.monthlyFlow.outgoings)}
+              essentialMonthlyOutgoings={Math.max(0, intelligence.essentialOutgoings.essential)}
+              essentialItemCount={essentialItemCount}
             />
 
             <SectionCard title="Your savings pots" description="The visual adapts to the goal. Custom images take priority; otherwise LOOP uses a holiday, emergency, home, car, education, gift or repairs visual. The top-right thread records monthly allocations.">
+              {attentionPotCount > 0 ? (
+                <p className="mb-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-black text-amber-800">
+                  {attentionPotCount} pot{attentionPotCount === 1 ? "" : "s"} behind pace — shown first below.
+                </p>
+              ) : null}
               <div className="grid gap-5 xl:grid-cols-2">
-                {potRows.map(({ pot, allocations, potMovements, allocated, target, remaining, monthly, neededPerMonth, thisMonthAmount, thisMonthProgress, progress, onTrackScore, priorityLabel, linkedAccount, owner }) => (
-                  <article key={pot.id} className="overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm">
+                {sortedPotRows.map(({ pot, allocations, potMovements, allocated, target, remaining, monthly, neededPerMonth, thisMonthAmount, thisMonthProgress, progress, onTrackScore, priorityLabel, linkedAccount, owner, attentionStatus }) => (
+                  <article key={pot.id} className={`overflow-hidden rounded-[2rem] border bg-white shadow-sm ${attentionStatus === "attention" ? "border-amber-300 ring-1 ring-amber-100" : "border-slate-200"}`}>
                     <div className="p-5">
                       <div className="flex items-start justify-between gap-3">
                         <div>
-                          <p className="text-xs font-black uppercase tracking-[0.16em] text-emerald-700">{owner?.name || "Household"} · {priorityLabel} priority</p>
+                          <p className="text-xs font-black uppercase tracking-[0.16em] text-emerald-700">{owner?.name || "Household"} · {priorityLabel} priority{attentionStatus === "attention" ? <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-amber-800">Behind pace</span> : null}</p>
                           <h3 className="mt-1 text-2xl font-black text-slate-950">{pot.name}</h3>
                           <p className="mt-1 text-sm font-bold text-slate-500">{pot.notes || "A goal for your savings"}</p>
                         </div>
@@ -1353,81 +1653,35 @@ export default async function AccountsPage({ searchParams }: { searchParams?: Pr
               <div className="grid gap-3 md:grid-cols-4">
                 <div className="rounded-3xl bg-slate-950 p-4 text-white"><p className="text-xs font-black uppercase tracking-wide text-white/50">Latest saved match</p><p className="mt-2 text-xl font-black">{latestRecommendationAt ? `${daysOld(latestRecommendationAt) ?? 0} day(s) ago` : "None yet"}</p><p className="mt-1 text-xs font-bold text-white/60">The worker only saves a row when it finds a positive compatible rate gap.</p></div>
                 <div className="rounded-3xl bg-blue-50 p-4"><p className="text-xs font-black uppercase tracking-wide text-blue-700">Accounts watched</p><p className="mt-2 text-2xl font-black text-slate-950">{accountRows.length}</p><p className="mt-1 text-xs font-bold text-slate-500">tracked savers eligible for checks</p></div>
-                <div className="rounded-3xl bg-emerald-50 p-4"><p className="text-xs font-black uppercase tracking-wide text-emerald-700">Saved actions</p><p className="mt-2 text-2xl font-black text-slate-950">{savingsRecommendations?.length ?? 0}</p><p className="mt-1 text-xs font-bold text-slate-500">active recommendations</p></div>
-                <div className="rounded-3xl bg-orange-50 p-4"><p className="text-xs font-black uppercase tracking-wide text-orange-700">Opportunity</p><p className="mt-2 text-2xl font-black text-slate-950">{intelligence.catalogue.status === "healthy" ? `${formatMoney((savingsRecommendations ?? []).reduce((sum, row) => sum + Number(row.estimated_annual_gain || 0), 0))}/yr` : "Check incomplete"}</p><p className="mt-1 text-xs font-bold text-slate-500">{intelligence.catalogue.activeDeals} active · {intelligence.catalogue.completeDeals} complete · {intelligence.catalogue.freshDeals} fresh</p></div>
+                <div className="rounded-3xl bg-emerald-50 p-4"><p className="text-xs font-black uppercase tracking-wide text-emerald-700">Saved actions</p><p className="mt-2 text-2xl font-black text-slate-950">{visibleSavingsRecommendations.length}</p><p className="mt-1 text-xs font-bold text-slate-500">compatible recommendations</p></div>
+                <div className="rounded-3xl bg-orange-50 p-4"><p className="text-xs font-black uppercase tracking-wide text-orange-700">Opportunity</p><p className="mt-2 text-2xl font-black text-slate-950">{intelligence.catalogue.status === "healthy" ? `${formatMoney(visibleSavingsRecommendations.reduce((sum, row) => sum + Number(row.estimated_annual_gain || 0), 0))}/yr` : "Check incomplete"}</p><p className="mt-1 text-xs font-bold text-slate-500">{intelligence.catalogue.activeDeals} active · {intelligence.catalogue.completeDeals} complete · {intelligence.catalogue.freshDeals} fresh</p></div>
               </div>
             </SectionCard>
 
-            <SectionCard title="Recommended reviews" description="These are generated by the morning worker from your actual balance, current rate, provider relationships and the reviewed savings deal catalogue.">
+            <SectionCard title="Best options for you" description="A short list for adult accounts. Child-only products are kept separate so they cannot be mistaken for a switch for your own savings.">
               <div className="grid gap-4 lg:grid-cols-2">
-                {(savingsRecommendations ?? []).map((recommendation) => {
+                {adultRecommendations.map((recommendation) => {
                   const account = recommendation.financial_account_id ? accountById.get(recommendation.financial_account_id) : null;
-                  return (
-                    <article key={recommendation.id} className="rounded-3xl border border-orange-200 bg-gradient-to-br from-orange-50 to-white p-5 shadow-sm">
-                      <div className="flex items-start justify-between gap-3">
-                        <div><p className="text-xs font-black uppercase tracking-wide text-orange-700">{account?.provider || "Tracked saver"} · {account?.name || "Account"}</p><h3 className="mt-1 text-xl font-black text-slate-950">{recommendation.provider_name || recommendation.provider_slug} · {recommendation.product_name || "Better-rate option"}</h3></div>
-                        <span className="rounded-full bg-white px-3 py-1 text-xs font-black text-orange-800">+{Number(recommendation.rate_delta || 0).toFixed(2)}%</span>
-                      </div>
-                      <div className="mt-4 grid grid-cols-3 gap-2">
-                        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Current</p><p className="font-black text-slate-950">{Number(recommendation.current_rate || 0).toFixed(2)}%</p></div>
-                        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Alternative</p><p className="font-black text-slate-950">{Number(recommendation.suggested_rate || 0).toFixed(2)}%</p></div>
-                        <div className="rounded-2xl bg-white p-3"><p className="text-[10px] font-black uppercase text-slate-400">Annual gain</p><p className="font-black text-slate-950">{formatMoney(recommendation.estimated_annual_gain)}</p></div>
-                      </div>
-                      <p className="mt-3 text-sm font-bold text-slate-600">{recommendation.reason || "Review product access, limits and eligibility before moving money."}</p>
-                      {recommendation.source_url ? <a href={recommendation.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-block text-xs font-black text-orange-700 underline">Open evidence source</a> : null}
-                    </article>
-                  );
+                  const deal = recommendation.savings_rate_deal_id ? dealById.get(recommendation.savings_rate_deal_id) : null;
+                  return <SavingsRecommendationCard key={recommendation.id} recommendation={recommendation} account={account} deal={deal} personLabel={personLabelForAccount(account)} />;
                 })}
-                {(savingsRecommendations ?? []).length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">{intelligence.catalogue.status === "healthy" ? "No positive compatible rate gap was found in the reviewed catalogue." : "Market check incomplete. This is not a £0 opportunity result: the catalogue needs more fresh, complete products before LOOP can make a reliable comparison."}</div> : null}
+                {adultRecommendations.length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">{intelligence.catalogue.status === "healthy" ? "No better compatible adult rate was found." : "The adult market check needs more fresh, complete products before LOOP can make a reliable comparison."}</div> : null}
               </div>
             </SectionCard>
 
-            <SectionCard title="Current deal catalogue" description="Likely eligible products are separated from existing-customer products that require another provider relationship.">
-              <div className="grid gap-6 xl:grid-cols-2">
-                <div>
-                  <h3 className="text-xl font-black text-slate-950">Likely eligible now</h3>
-                  <div className="mt-4 grid gap-3">
-                    {eligibleDeals.slice(0, 8).map((deal) => {
-                      const returnModel = maximumDealReturn(deal);
-                      const feedback = eligibilityByDeal.get(deal.id) as any;
-                      return (
-                      <article key={deal.id} className="rounded-3xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm">
-                        <div className="flex items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-emerald-700">{deal.provider_name ?? deal.provider_slug}</p><h4 className="mt-1 text-lg font-black text-slate-950">{deal.product_name ?? "Savings deal"}</h4></div><span className="rounded-full bg-white px-3 py-1 text-xs font-black text-emerald-800">Eligible</span></div>
-                        <p className="mt-2 text-3xl font-black text-slate-950">{deal.gross_aer != null ? `${Number(deal.gross_aer).toFixed(2)}%` : "Rate TBC"}</p>
-                        <p className="mt-2 text-sm font-bold text-slate-600">Best estimated uplift: {formatMoney(deal.best_gain || 0)} / year</p>
-                        <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-3">{dealInfoRows(deal).map((row) => <div key={row.label} className="rounded-2xl bg-white/80 p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{row.label}</p><p className="mt-1 text-xs font-black text-slate-950">{row.value}</p></div>)}</div>
-                        {returnModel ? <div className="mt-3 rounded-2xl bg-emerald-900 p-3 text-white"><p className="text-[10px] font-black uppercase tracking-wide text-emerald-200">Maximum modelled return</p><p className="mt-1 text-sm font-black">Up to {formatMoney(returnModel.interest)} interest on {formatMoney(returnModel.deposit)}</p><p className="mt-1 text-[11px] font-semibold text-emerald-100">Estimate from the published rate, deposit cap and term; product timing and rate changes may alter it.</p></div> : null}
-                        <form action={saveSavingsDealEligibility} className="mt-3 flex flex-wrap items-center gap-2">
-                          <input type="hidden" name="savings_rate_deal_id" value={deal.id} />
-                          <span className="text-xs font-black text-emerald-900">Eligible?</span>
-                          <button name="eligibility_status" value="eligible" className={`rounded-full px-3 py-1.5 text-xs font-black ${feedback?.eligibility_status === "eligible" ? "bg-emerald-900 text-white" : "bg-white text-emerald-800"}`}>✓ Yes</button>
-                          <button name="eligibility_status" value="not_eligible" className={`rounded-full px-3 py-1.5 text-xs font-black ${feedback?.eligibility_status === "not_eligible" ? "bg-rose-600 text-white" : "bg-white text-rose-700"}`}>× No</button>
-                          <label className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-black ${feedback?.used_before ? "bg-blue-700 text-white" : "bg-white text-blue-700"}`}><input type="checkbox" name="used_before" value="true" defaultChecked={Boolean(feedback?.used_before)} className="h-4 w-4 accent-blue-700" /> Used before</label>
-                        </form>
-                        {deal.withdrawal_rules ? <p className="mt-3 rounded-2xl bg-white/80 p-3 text-xs font-bold text-slate-600">Withdrawals/access: {deal.withdrawal_rules}</p> : null}
-                        {deal.source_url ? <a href={deal.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-block text-xs font-black text-emerald-800 underline">Open source</a> : null}
-                      </article>
-                      );
-                    })}
-                    {eligibleDeals.length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">No active reviewed eligible deals are logged. Add or refresh rows in Admin → Savings catalogue.</div> : null}
-                  </div>
-                </div>
-                <div>
-                  <h3 className="text-xl font-black text-slate-950">Could unlock with another provider</h3>
-                  <div className="mt-4 grid gap-3">
-                    {needsProviderDeals.slice(0, 8).map((deal) => (
-                      <article key={deal.id} className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-                        <p className="text-xs font-black uppercase tracking-[0.16em] text-orange-600">Needs relationship</p>
-                        <h4 className="mt-1 text-lg font-black text-slate-950">{deal.provider_name ?? deal.provider_slug} · {deal.product_name ?? "Savings deal"}</h4>
-                        <p className="mt-2 text-2xl font-black text-slate-950">{deal.gross_aer != null ? `${Number(deal.gross_aer).toFixed(2)}%` : "Rate TBC"}</p>
-                        <p className="mt-2 text-sm font-bold text-slate-500">Requires: {deal.eligible_provider_slug || deal.provider_slug || "provider relationship"}</p>
-                        <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-3">{dealInfoRows(deal).slice(0, 6).map((row) => <div key={row.label} className="rounded-2xl bg-slate-50 p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{row.label}</p><p className="mt-1 text-xs font-black text-slate-950">{row.value}</p></div>)}</div>
-                        {deal.source_url ? <a href={deal.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-block text-xs font-black text-orange-600 underline">Open source</a> : null}
-                      </article>
-                    ))}
-                    {needsProviderDeals.length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">No locked provider-only deals at the moment.</div> : null}
-                  </div>
-                </div>
+            {childRecommendations.length || childDeals.length ? <SectionCard title="For the children" description="Junior and child-only products live here. They are never compared with an adult account.">
+              {childRecommendations.length ? <div className="mb-6 grid gap-4 lg:grid-cols-2">{childRecommendations.map((recommendation) => {
+                const account = recommendation.financial_account_id ? accountById.get(recommendation.financial_account_id) : null;
+                const deal = recommendation.savings_rate_deal_id ? dealById.get(recommendation.savings_rate_deal_id) : null;
+                return <SavingsRecommendationCard key={recommendation.id} recommendation={recommendation} account={account} deal={deal} personLabel={personLabelForAccount(account) || childAudienceLabel} />;
+              })}</div> : null}
+              <div className="grid gap-4 lg:grid-cols-2">{childDeals.slice(0, 6).map((deal) => <SavingsDealCard key={deal.id} deal={deal} personLabel={childAudienceLabel} feedback={eligibilityByDeal.get(deal.id)} />)}</div>
+            </SectionCard> : null}
+
+            <SectionCard title="Explore adult savings accounts" description="Start with the practical limits. Open a card only when the headline rate, pay-in limit and access fit what you need.">
+              <div className="grid gap-8 xl:grid-cols-2">
+                <div><h3 className="text-xl font-black text-slate-950">Available now</h3><p className="mt-1 text-sm font-bold text-slate-500">Open-market or already eligible through a relationship.</p><div className="mt-5 grid gap-5">{adultEligibleDeals.slice(0, 8).map((deal) => <SavingsDealCard key={deal.id} deal={deal} personLabel={defaultOwnerPerson?.name || "You"} feedback={eligibilityByDeal.get(deal.id)} />)}{adultEligibleDeals.length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">No reviewed adult deals are currently marked as available.</div> : null}</div></div>
+                <div><h3 className="text-xl font-black text-slate-950">Needs another relationship</h3><p className="mt-1 text-sm font-bold text-slate-500">Useful to see, but not immediately available to you.</p><div className="mt-5 grid gap-5">{adultNeedsProviderDeals.slice(0, 8).map((deal) => <SavingsDealCard key={deal.id} deal={deal} personLabel={defaultOwnerPerson?.name || "You"} feedback={eligibilityByDeal.get(deal.id)} />)}{adultNeedsProviderDeals.length === 0 ? <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm font-bold text-slate-500">No relationship-only adult deals at the moment.</div> : null}</div></div>
               </div>
             </SectionCard>
           </div>
