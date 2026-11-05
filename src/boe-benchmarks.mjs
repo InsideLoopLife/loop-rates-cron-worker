@@ -65,27 +65,55 @@ function parseLtvTier(title) {
   return match ? Number(match[1]) : null;
 }
 
-function parseBoeCsv(dataCsv, seriesToTitle) {
-  const lines = dataCsv.trim().split('\n');
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
+// BoE's IADB wants English 3-letter month abbreviations ("Sep"). Don't use
+// toLocaleString — Node 22's ICU formats September as "Sept" in en-GB, which
+// makes BoE return an HTML error page for every request whose start date
+// falls in September (this broke every run from 1 Nov 2026).
+const BOE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function formatBoeDate(d) {
+  return `${String(d.getDate()).padStart(2, '0')}/${BOE_MONTHS[d.getMonth()]}/${d.getFullYear()}`;
+}
+
+// Response shape (seen in production logs): a "SERIES,DESCRIPTION" block with
+// one line per series, then a "DATE,<code>,<code>..." data table. Lines end \r\n.
+export function parseBoeResponse(csvText) {
+  const lines = csvText.replace(/\r/g, '').split('\n');
+  const dataIndex = lines.findIndex((l) => /^"?DATE"?,/.test(l.trim()));
+
+  const seriesToTitle = {};
+  const headerBlock = dataIndex >= 0 ? lines.slice(0, dataIndex) : [];
+  for (const line of headerBlock) {
+    const m = line.match(/^"?([A-Z0-9]{5,10})"?,(.*)$/);
+    if (m && m[1] !== 'SERIES') seriesToTitle[m[1]] = m[2].replace(/"/g, '').trim();
+  }
+
+  const dataLines = dataIndex >= 0 ? lines.slice(dataIndex).filter((l) => l.trim()) : [];
+  return { seriesToTitle, dataLines, dataStartFound: dataIndex >= 0 };
+}
+
+function parseBoeCsv(dataLines, seriesToTitle) {
+  if (dataLines.length < 2) return [];
+  const headers = dataLines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
   const rows = [];
 
-  // Only need the most recent month per series — this table holds a current
-  // snapshot, not a history; re-running the job just refreshes the latest.
-  for (let i = lines.length - 1; i >= 1; i--) {
-    const cells = lines[i].split(',').map((c) => c.trim().replace(/^"|"$/g, ''));
-    if (cells.length !== headers.length) continue;
-    const date = new Date(cells[0]);
-    if (Number.isNaN(date.getTime())) continue;
-    const effectiveMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
-
-    for (let col = 1; col < headers.length; col++) {
-      const seriesCode = headers[col];
+  // This table holds a current snapshot, so we only need each series' most
+  // recent value. Bank Rate (IUDBEDR) is daily while the mortgage series are
+  // monthly, so the newest rows only have Bank Rate filled in. Walk back per
+  // series until we find that series' own latest value — previously the loop
+  // stopped at the very last row and only ever saved Bank Rate.
+  for (let col = 1; col < headers.length; col++) {
+    const seriesCode = headers[col];
+    for (let i = dataLines.length - 1; i >= 1; i--) {
+      const cells = dataLines[i].split(',').map((c) => c.trim().replace(/^"|"$/g, ''));
+      if (cells.length !== headers.length) continue;
       const rawValue = cells[col];
-      if (!rawValue || rawValue === '..' || rawValue === '0') continue; // BoE's own gap markers
+      if (!rawValue || rawValue === '..') continue; // BoE's own gap markers
       const ratePercent = Number(rawValue);
       if (!Number.isFinite(ratePercent) || ratePercent <= 0) continue;
+      const date = new Date(cells[0]);
+      if (Number.isNaN(date.getTime())) continue;
+      const effectiveMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
 
       const title = seriesToTitle[seriesCode] || '';
       let termType = parseTermType(title);
@@ -97,57 +125,56 @@ function parseBoeCsv(dataCsv, seriesToTitle) {
       if (!termType && CONFIRMED_TERM_TYPE_MAP[seriesCode] !== undefined) {
         termType = CONFIRMED_TERM_TYPE_MAP[seriesCode];
       }
-      if (!termType) continue; // can't confidently classify — skip rather than guess
-
-      rows.push({ seriesCode, termType, ltvTier, ratePercent, effectiveMonth, rawTitle: title });
+      if (termType) rows.push({ seriesCode, termType, ltvTier, ratePercent, effectiveMonth, rawTitle: title });
+      break; // latest value found for this series (classified or not)
     }
-    break; // only the latest row per series
   }
   return rows;
+}
+
+export function parseBoeBenchmarks(csvText) {
+  const { seriesToTitle, dataLines, dataStartFound } = parseBoeResponse(csvText);
+  const rows = parseBoeCsv(dataLines, seriesToTitle);
+  return { rows, seriesToTitle, dataLines, dataStartFound };
+}
+
+async function requestBoeCsv(url, userAgent) {
+  // BoE sometimes returns its HTML "Error" page with HTTP 200 (seen 30 Oct
+  // 08:00 with a valid request). Retry once after a pause before giving up.
+  let lastText = '';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const res = await fetch(url, { headers: { 'user-agent': userAgent, accept: 'text/csv,text/plain,*/*' } });
+    if (!res.ok) throw new Error(`BoE IADB request failed: HTTP ${res.status}`);
+    lastText = await res.text();
+    if (!/^\s*<(!DOCTYPE|html)/i.test(lastText)) return { csvText: lastText, attempts: attempt };
+    if (attempt === 1) await new Promise((r) => setTimeout(r, 5000));
+  }
+  return { csvText: lastText, attempts: 2 };
 }
 
 async function fetchBoeMortgageBenchmarks(userAgent) {
   const codes = BOE_SERIES_CODES.join(',');
   const dateFrom = new Date();
-  dateFrom.setMonth(dateFrom.getMonth() - 2);
-  const fmt = (d) => `${String(d.getDate()).padStart(2, '0')}/${d.toLocaleString('en-GB', { month: 'short' })}/${d.getFullYear()}`;
+  dateFrom.setMonth(dateFrom.getMonth() - 3); // 3 months: monthly series publish with a ~1 month lag
 
   const url =
     `https://www.bankofengland.co.uk/boeapps/database/_iadb-FromShowColumns.asp?csv.x=yes` +
-    `&Datefrom=${fmt(dateFrom)}&Dateto=now&SeriesCodes=${codes}&CSVF=TT&UsingCodes=Y&VPD=Y&VFD=N`;
+    `&Datefrom=${formatBoeDate(dateFrom)}&Dateto=now&SeriesCodes=${codes}&CSVF=TT&UsingCodes=Y&VPD=Y&VFD=N`;
 
-  const res = await fetch(url, { headers: { 'user-agent': userAgent } });
-  if (!res.ok) throw new Error(`BoE IADB request failed: HTTP ${res.status}`);
-  const csvText = await res.text();
-
-  const headerLines = csvText.split('\n').slice(0, 6);
-  const seriesToTitle = {};
-  for (const code of BOE_SERIES_CODES) {
-    const titleLine = headerLines.find((l) => l.includes(code));
-    if (titleLine) seriesToTitle[code] = titleLine.replace(/"/g, '').trim();
-  }
-
-  const dataStart = csvText.indexOf('\nDATE');
-  const dataCsv = dataStart >= 0 ? csvText.slice(dataStart + 1) : csvText;
-
-  const rows = parseBoeCsv(dataCsv, seriesToTitle);
+  const { csvText, attempts } = await requestBoeCsv(url, userAgent);
+  const { rows, dataLines, dataStartFound } = parseBoeBenchmarks(csvText);
   const foundCodes = new Set(rows.map((r) => r.seriesCode));
   const skippedSeries = BOE_SERIES_CODES.filter((c) => !foundCodes.has(c));
 
-  // DIAGNOSTICS — added because 14/15 series were silently missing from real
-  // output with no way to tell why (title parsing found nothing at all, not
-  // even for the series that DID work). This surfaces what BoE's response
-  // actually contained on the next run, instead of guessing again blind.
-  const headerRowLine = dataStart >= 0 ? csvText.slice(dataStart + 1).split('\n')[0] : dataCsv.split('\n')[0];
-  const headerColumnsFound = headerRowLine ? headerRowLine.split(',').map((h) => h.trim().replace(/^"|"$/g, '')) : [];
-  const requestedButAbsentFromHeader = BOE_SERIES_CODES.filter((c) => !headerColumnsFound.includes(c));
+  const headerColumnsFound = dataLines[0] ? dataLines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, '')) : [];
   const diagnostics = {
-    dataStartFound: dataStart >= 0,
+    requestUrl: url,
+    attempts,
+    dataStartFound,
     headerColumnsFound,
-    requestedButAbsentFromHeader, // if non-empty, BoE's response never included these columns at all —
-                                    // points at a request-side issue (too many codes, wrong param), not a parsing bug
+    requestedButAbsentFromHeader: BOE_SERIES_CODES.filter((c) => !headerColumnsFound.includes(c)),
     csvTextLength: csvText.length,
-    csvTextFirst500Chars: csvText.slice(0, 500),
+    csvTextFirst300Chars: csvText.slice(0, 300),
   };
 
   return { rows, skippedSeries, diagnostics };
