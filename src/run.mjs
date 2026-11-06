@@ -376,6 +376,8 @@ async function runAppMaintenance() {
     "/api/cron/property-archive-cleanup",
     "/api/cron/provider-glossary-daily-check",
     "/api/cron/notification-insights",
+    "/api/cron/calendar-sync",
+    "/api/cron/uptime-checks",
   ];
   if (new Date().getUTCDay() === 1) paths.push("/api/cron/weekly-digest");
   const detail = [];
@@ -389,7 +391,7 @@ async function runAppMaintenance() {
   // infrastructure, not external sites, so there's no reason not to run
   // them all at once — worst case becomes whatever the single slowest
   // endpoint takes, not the sum of all of them.
-  await mapWithConcurrency(paths, 5, async (path) => {
+  const callApp = async (path) => {
     try {
       const response = await fetch(`${config.appBaseUrl}${path}`, {
         headers: { authorization: `Bearer ${config.cronSecret}`, "x-loop-worker": "rates-database-worker-v2" },
@@ -401,7 +403,11 @@ async function runAppMaintenance() {
     } catch (error) {
       detail.push({ path, ok: false, error: messageOf(error) });
     }
-  });
+  };
+  await mapWithConcurrency(paths, 5, callApp);
+  // Health checks last, so admin alerts reflect this run's results.
+  paths.push("/api/cron/admin-alerts-refresh");
+  await callApp("/api/cron/admin-alerts-refresh");
   return { skipped: false, checked: paths.length, failed: detail.filter((row) => !row.ok).length, detail };
 }
 
