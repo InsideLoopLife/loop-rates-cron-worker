@@ -378,6 +378,7 @@ async function runAppMaintenance() {
     "/api/cron/notification-insights",
     "/api/cron/calendar-sync",
     "/api/cron/uptime-checks",
+    "/api/cron/council-tax-refresh",
   ];
   if (new Date().getUTCDay() === 1) paths.push("/api/cron/weekly-digest");
   const detail = [];
