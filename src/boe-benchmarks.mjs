@@ -1,20 +1,10 @@
 // src/boe-benchmarks.mjs
 //
-// Fetches the Bank of England's official "Quoted household interest rates" —
-// objective market averages, not lender-specific products. This is the FCA-safe
-// approach discussed: report economic statistics, don't promote any lender's
-// actual product. Zero cost, no API key, no headless browser needed — BoE's
-// data is a plain CSV export, so it fits this worker's existing plain-fetch
-// architecture without adding Playwright/Chromium.
-//
-// Source: https://www.bankofengland.co.uk/boeapps/database/ (BoE's own
-// documented open-data access method — confirmed via a public tutorial
-// showing a successful automated fetch of this exact endpoint).
-//
-// HONEST LIMITATION: I could not personally fetch this URL to see a live
-// response — BoE's robots.txt blocks my own tooling, a policy on my end, not
-// confirmed proof their server blocks this worker's request. The first real
-// run is the actual test; check the phase result's `skippedSeries` list.
+// Bank of England figures for mortgage comparisons.
+//  - Bank Rate: read daily from the public "Current official Bank Rate" page.
+//  - Quoted household mortgage averages (monthly, by term and LTV): the Bank's
+//    robots.txt disallows automated use of its CSV export, so these are loaded
+//    from a CSV an admin downloads in a browser; parseBoeBenchmarks parses it.
 
 const BOE_SERIES_CODES = [
   'IUMZICQ', // 2yr fixed, 60% LTV — confirmed via BoE's own chart labels
@@ -138,80 +128,69 @@ export function parseBoeBenchmarks(csvText) {
   return { rows, seriesToTitle, dataLines, dataStartFound };
 }
 
-async function requestBoeCsv(url, userAgent) {
-  // BoE sometimes returns its HTML "Error" page with HTTP 200 (seen 30 Oct
-  // 08:00 with a valid request). Retry once after a pause before giving up.
-  let lastText = '';
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const res = await fetch(url, { headers: { 'user-agent': userAgent, accept: 'text/csv,text/plain,*/*' } });
-    if (!res.ok) throw new Error(`BoE IADB request failed: HTTP ${res.status}`);
-    lastText = await res.text();
-    if (!/^\s*<(!DOCTYPE|html)/i.test(lastText)) return { csvText: lastText, attempts: attempt };
-    if (attempt === 1) await new Promise((r) => setTimeout(r, 5000));
+// The Bank's robots.txt disallows automated access to
+// /boeapps/database/_iadb-FromShowColumns.asp (the CSV export), and since
+// 31 Oct 2026 it returns an error page to this worker. So the worker no longer
+// calls it. Bank Rate comes from the public "Current official Bank Rate" page
+// (/boeapps/database/Bank-Rate, not disallowed). The monthly quoted mortgage
+// averages are loaded by an admin uploading the CSV they download in a browser
+// (parseBoeBenchmarks above handles that file).
+const BANK_RATE_URL = 'https://www.bankofengland.co.uk/boeapps/database/Bank-Rate.asp';
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+/** Most recent change in the "Date Changed | Rate" table, e.g. "05 Nov 26 | 4.00". */
+export function parseBankRatePage(html) {
+  const text = String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ');
+  const re = /\b(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{2}|\d{4}) (\d{1,2}\.\d{1,3})\b/g;
+  const changes = [];
+  for (const m of text.matchAll(re)) {
+    const year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+    const date = new Date(Date.UTC(year, MONTHS[m[2].toLowerCase()], Number(m[1])));
+    const rate = Number(m[4]);
+    if (rate > 0 && rate < 20 && year >= 1990) changes.push({ date, rate });
   }
-  return { csvText: lastText, attempts: 2 };
-}
-
-async function fetchBoeMortgageBenchmarks(userAgent) {
-  const codes = BOE_SERIES_CODES.join(',');
-  const dateFrom = new Date();
-  dateFrom.setMonth(dateFrom.getMonth() - 3); // 3 months: monthly series publish with a ~1 month lag
-
-  const url =
-    `https://www.bankofengland.co.uk/boeapps/database/_iadb-FromShowColumns.asp?csv.x=yes` +
-    `&Datefrom=${formatBoeDate(dateFrom)}&Dateto=now&SeriesCodes=${codes}&CSVF=TT&UsingCodes=Y&VPD=Y&VFD=N`;
-
-  const { csvText, attempts } = await requestBoeCsv(url, userAgent);
-  const { rows, dataLines, dataStartFound } = parseBoeBenchmarks(csvText);
-  const foundCodes = new Set(rows.map((r) => r.seriesCode));
-  const skippedSeries = BOE_SERIES_CODES.filter((c) => !foundCodes.has(c));
-
-  const headerColumnsFound = dataLines[0] ? dataLines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, '')) : [];
-  const diagnostics = {
-    requestUrl: url,
-    attempts,
-    dataStartFound,
-    headerColumnsFound,
-    requestedButAbsentFromHeader: BOE_SERIES_CODES.filter((c) => !headerColumnsFound.includes(c)),
-    csvTextLength: csvText.length,
-    csvTextFirst300Chars: csvText.slice(0, 300),
-  };
-
-  return { rows, skippedSeries, diagnostics };
+  if (!changes.length) return null;
+  changes.sort((a, b) => b.date - a.date);
+  return { changedOn: changes[0].date.toISOString().slice(0, 10), ratePercent: changes[0].rate, changesFound: changes.length };
 }
 
 export async function refreshBoeBenchmarks(supabase, userAgent) {
-  const { rows, skippedSeries, diagnostics } = await fetchBoeMortgageBenchmarks(userAgent);
-
-  if (!rows.length) {
-    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, diagnostics, detail: [{ ok: false, error: 'No benchmark rows parsed — BoE response format may have changed, or the fetch was blocked' }] };
+  let parsed = null;
+  let diagnostics = { requestUrl: BANK_RATE_URL };
+  try {
+    const res = await fetch(BANK_RATE_URL, { headers: { 'user-agent': userAgent, accept: 'text/html' } });
+    const html = await res.text();
+    diagnostics = { ...diagnostics, status: res.status, length: html.length };
+    if (res.ok) parsed = parseBankRatePage(html);
+    if (!parsed) diagnostics.first300 = html.slice(0, 300);
+  } catch (error) {
+    diagnostics.error = error?.message || String(error);
   }
 
-  const { error } = await supabase.from('mortgage_market_rate_benchmarks').upsert(
-    rows.map((r) => ({
-      series_code: r.seriesCode,
-      term_type: r.termType,
-      ltv_tier: r.ltvTier,
-      rate_percent: r.ratePercent,
-      effective_month: r.effectiveMonth,
-      raw_series_title: r.rawTitle,
-      source: 'boe_iadb',
-      fetched_at: new Date().toISOString(),
-    })),
-    { onConflict: 'series_code,effective_month' },
-  );
+  if (!parsed) {
+    return { checked: 1, inserted: 0, updated: 0, failed: 1, skippedSeries: ['IUDBEDR'], diagnostics, detail: [{ ok: false, error: 'Could not read Bank Rate from the Bank of England page' }] };
+  }
+
+  const now = new Date();
+  const effectiveMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-01`;
+  const { error } = await supabase.from('mortgage_market_rate_benchmarks').upsert([{
+    series_code: 'IUDBEDR',
+    term_type: 'bank_rate',
+    ltv_tier: null,
+    rate_percent: parsed.ratePercent,
+    effective_month: effectiveMonth,
+    raw_series_title: `Official Bank Rate (last changed ${parsed.changedOn})`,
+    source: 'boe_bank_rate_page',
+    fetched_at: now.toISOString(),
+  }], { onConflict: 'series_code,effective_month' });
 
   if (error) {
-    return { checked: BOE_SERIES_CODES.length, inserted: 0, updated: 0, failed: BOE_SERIES_CODES.length, skippedSeries, diagnostics, detail: [{ ok: false, error: `Upsert failed: ${error.message}` }] };
+    return { checked: 1, inserted: 0, updated: 0, failed: 1, skippedSeries: ['IUDBEDR'], diagnostics, detail: [{ ok: false, error: `Upsert failed: ${error.message}` }] };
   }
-
-  return {
-    checked: BOE_SERIES_CODES.length,
-    inserted: rows.length,
-    updated: 0,
-    failed: skippedSeries.length,
-    skippedSeries,
-    diagnostics,
-    detail: [{ ok: true, rowsWritten: rows.length, skippedSeries }],
-  };
+  return { checked: 1, inserted: 1, updated: 0, failed: 0, skippedSeries: [], diagnostics: { ...diagnostics, ...parsed }, detail: [{ ok: true, bankRate: parsed.ratePercent, changedOn: parsed.changedOn }] };
 }

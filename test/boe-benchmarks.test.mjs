@@ -39,3 +39,20 @@ test("HTML error page yields no rows", () => {
   assert.equal(rows.length, 0);
   assert.equal(dataStartFound, false);
 });
+
+import { parseBankRatePage } from "../src/boe-benchmarks.mjs";
+
+test("Bank Rate page: newest change wins", () => {
+  const html = `<table><thead><tr><th>Date Changed</th><th>Rate</th></tr></thead><tbody>
+    <tr><td>07 Aug 25</td><td>4.00</td></tr>
+    <tr><td>05 Nov 26</td><td>4.00</td></tr>
+    <tr><td>18 Dec 25</td><td>3.75</td></tr></tbody></table>`;
+  const parsed = parseBankRatePage(html);
+  assert.equal(parsed.changedOn, "2026-11-05");
+  assert.equal(parsed.ratePercent, 4);
+  assert.equal(parsed.changesFound, 3);
+});
+
+test("Bank Rate page: nothing recognisable returns null", () => {
+  assert.equal(parseBankRatePage("<html><body>Error</body></html>"), null);
+});
