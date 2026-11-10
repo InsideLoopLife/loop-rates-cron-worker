@@ -148,11 +148,15 @@ export function parseBankRatePage(html) {
     .replace(/\s+/g, ' ');
   const re = /\b(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{2}|\d{4}) (\d{1,2}\.\d{1,3})\b/g;
   const changes = [];
+  const thisYear = new Date().getUTCFullYear();
   for (const m of text.matchAll(re)) {
-    const year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+    // The table uses two-digit years back to the 1970s: "04 Nov 99" is 1999,
+    // not 2099. Anything that would land in the future is the previous century.
+    const yy = Number(m[3]);
+    const year = m[3].length === 4 ? yy : (2000 + yy > thisYear ? 1900 + yy : 2000 + yy);
     const date = new Date(Date.UTC(year, MONTHS[m[2].toLowerCase()], Number(m[1])));
     const rate = Number(m[4]);
-    if (rate > 0 && rate < 20 && year >= 1990) changes.push({ date, rate });
+    if (rate > 0 && rate < 20 && date.getTime() <= Date.now() + 86400000) changes.push({ date, rate });
   }
   if (!changes.length) return null;
   changes.sort((a, b) => b.date - a.date);

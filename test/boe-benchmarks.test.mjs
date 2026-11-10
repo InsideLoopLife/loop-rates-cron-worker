@@ -53,6 +53,18 @@ test("Bank Rate page: newest change wins", () => {
   assert.equal(parsed.changesFound, 3);
 });
 
+test("Bank Rate page: two-digit years from the last century are not the future", () => {
+  // The real page runs back to 1975; "04 Nov 99" (5.50%) was read as 2099.
+  const html = `<table><tbody>
+    <tr><td>05 Nov 26</td><td>4.00</td></tr>
+    <tr><td>18 Dec 25</td><td>3.75</td></tr>
+    <tr><td>04 Nov 99</td><td>5.50</td></tr>
+    <tr><td>08 Sep 98</td><td>7.50</td></tr></tbody></table>`;
+  const parsed = parseBankRatePage(html);
+  assert.equal(parsed.changedOn, "2026-11-05");
+  assert.equal(parsed.ratePercent, 4);
+});
+
 test("Bank Rate page: nothing recognisable returns null", () => {
   assert.equal(parseBankRatePage("<html><body>Error</body></html>"), null);
 });
