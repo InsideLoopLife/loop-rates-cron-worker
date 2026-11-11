@@ -294,7 +294,13 @@ async function refreshMortgages() {
       const existingRows = await selectRows("mortgage_rate_deals", "id,external_product_key,status,catalogue_status,missing_observation_count", (q) =>
         q.eq("source_id", source.id).in("catalogue_status", ["active", "needs_review", "broken", "pending_withdrawal"])
       );
-      const existingByKey = new Map(existingRows.map((row) => [row.external_product_key, row]));
+      // A deal that was withdrawn earlier and comes back has the same key: find
+      // it among withdrawn rows too, or the insert hits the unique index
+      // (NatWest failed this way every run).
+      const allRows = await selectRows("mortgage_rate_deals", "id,external_product_key,status,catalogue_status,missing_observation_count", (q) =>
+        q.eq("source_id", source.id)
+      );
+      const existingByKey = new Map([...allRows, ...existingRows].map((row) => [row.external_product_key, row]));
       const seen = new Set();
 
       await mapWithConcurrency(parsed, 3, async (deal) => {
